@@ -1,0 +1,38 @@
+name: Transcribir clases
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # cada 30 minutos (hora UTC)
+  workflow_dispatch:           # botón "Run workflow" para correrlo a mano
+
+# Nunca dos corridas a la vez: si una sigue en curso, la nueva espera.
+concurrency:
+  group: transcribir
+  cancel-in-progress: false
+
+jobs:
+  transcribir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Transcribir y resumir
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CARPETA_CLASES_ID: ${{ secrets.CARPETA_CLASES_ID }}
+        run: python transcribir.py
