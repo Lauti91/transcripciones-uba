@@ -77,6 +77,11 @@ TIMEOUT_GEMINI_S = 300
 # Pausa entre tramos consecutivos, para no superar el límite de tokens por minuto.
 PAUSA_ENTRE_TRAMOS_S = 60
 
+# Los resúmenes los genera una tarea programada de Gemini (Spark) a partir de
+# las transcripciones. Con False, este script solo transcribe. Se puede
+# forzar con la variable de entorno HACER_RESUMENES=true.
+HACER_RESUMENES = os.environ.get("HACER_RESUMENES", "false").lower() == "true"
+
 EXTENSIONES_AUDIO = {"m4a", "mp3", "wav", "ogg", "oga", "opus", "aac", "flac", "amr", "webm", "3gp", "mp4"}
 
 PROMPT_TRANSCRIBIR = (
@@ -557,7 +562,7 @@ def transcribir_pendientes(drive, api_key, m):
 
         # Recién transcripta: resumirla ya, si queda tiempo
         nuevos = archivos_por_nombre(drive, m["trans"])
-        if base in nuevos and not tiempo_agotado():
+        if HACER_RESUMENES and base in nuevos and not tiempo_agotado():
             try:
                 resumir(drive, api_key, m["materia"], base, nuevos[base], m["trans"])
             except Exception as e:  # noqa: BLE001
@@ -568,7 +573,8 @@ def main():
     api_key = env("GEMINI_API_KEY")
     drive = conectar_drive()
     materias = obtener_materias(drive, env("CARPETA_CLASES_ID"))
-    log(f"Materias: {', '.join(m for m, _ in materias) or 'ninguna'}")
+    log(f"Materias: {', '.join(m for m, _ in materias) or 'ninguna'}"
+        f" | resúmenes en este script: {'sí' if HACER_RESUMENES else 'no (los hace Gemini Spark)'}")
 
     preparadas = []
     for nombre, carpeta_id in materias:
@@ -577,8 +583,8 @@ def main():
         except Exception as e:  # noqa: BLE001
             log(f"[{nombre}] ERROR al leer la materia: {e}. La salteo en esta corrida.")
 
-    # Fase 1: resúmenes pendientes (rápidos, usan otros modelos que la transcripción)
-    for m in preparadas:
+    # Fase 1: resúmenes pendientes (solo si están activados en este script)
+    for m in (preparadas if HACER_RESUMENES else []):
         try:
             resumir_pendientes(drive, api_key, m)
         except Exception as e:  # noqa: BLE001
