@@ -49,9 +49,11 @@ MODELO_TRANSCRIPCION = "gemini-3.5-transcribe"
 # Para el resumen: si uno está saturado, se prueba el siguiente.
 MODELOS_RESUMEN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
 
-# 40 min de audio ≈ 76.800 tokens (32 por segundo): margen cómodo bajo el
-# límite de 98.304 del modelo de transcripción.
-SEGUNDOS_POR_TRAMO = 40 * 60
+# Máximo por tramo: 45 min de audio ≈ 86.400 tokens (32 por segundo), bajo el
+# límite de 98.304 del modelo de transcripción. La clase se reparte en tramos
+# IGUALES (ej. 85 min -> 2 de 42,5), para no gastar un pedido en un resto corto:
+# la cuota diaria de pedidos es el cuello de botella.
+SEGUNDOS_POR_TRAMO = 45 * 60
 
 # Reintentos ante saturación (503) o límites (429): espera creciente.
 # Pocos a propósito: cada reintento gasta cuota diaria, y el workflow
@@ -438,7 +440,8 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
 
         duracion = duracion_segundos(ruta)
         total = max(1, math.ceil(duracion / SEGUNDOS_POR_TRAMO))
-        log(f"{etiqueta}: {duracion / 60:.0f} min -> {total} tramo(s) de hasta {SEGUNDOS_POR_TRAMO // 60} min.")
+        largo = math.ceil(duracion / total) + 1  # +1 s para no perder el final
+        log(f"{etiqueta}: {duracion / 60:.0f} min -> {total} tramo(s) de ~{largo / 60:.0f} min.")
 
         partes_existentes = archivos_por_nombre(drive, carpeta_partes)
         nombres_partes = [f"{base} - parte {i + 1} de {total}" for i in range(total)]
@@ -452,7 +455,7 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
                 return False
 
             tramo = Path(tmp) / f"tramo_{i + 1}.mp3"
-            extraer_tramo(ruta, i * SEGUNDOS_POR_TRAMO, SEGUNDOS_POR_TRAMO, tramo)
+            extraer_tramo(ruta, i * (largo - 1), largo, tramo)
             archivo_gemini = subir_a_gemini(api_key, tramo)
             try:
                 texto = generar(
