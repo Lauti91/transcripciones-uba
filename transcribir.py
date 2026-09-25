@@ -25,6 +25,7 @@ import io
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -53,9 +54,12 @@ MODELOS_RESUMEN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "
 SEGUNDOS_POR_TRAMO = 40 * 60
 
 # Reintentos ante saturación (503) o límites (429): espera creciente.
-MAX_REINTENTOS = 8
+# Pocos a propósito: cada reintento gasta cuota diaria, y el workflow
+# corre cada 30 min, así que es mejor insistir poco y repartir los
+# intentos entre corridas que agotar la cuota en una sola.
+MAX_REINTENTOS = 3
 ESPERA_INICIAL_S = 30
-ESPERA_MAXIMA_S = 300
+ESPERA_MAXIMA_S = 120
 
 # Tiempo máximo de trabajo por corrida. Pasado esto no se empieza nada
 # nuevo; lo pendiente sigue en la próxima corrida.
@@ -461,44 +465,70 @@ def resumir(drive, api_key, materia, base, transcripcion, carpeta_trans):
     log(f"{etiqueta}: resumen pendiente para la próxima corrida. Último error: {ultimo_error}")
 
 
-def procesar_materia(drive, api_key, materia, carpeta_id):
+def preparar_materia(drive, materia, carpeta_id):
+    """Carpetas de salida y lista de audios de una materia."""
     carpeta_trans = subcarpeta(drive, carpeta_id, NOMBRE_TRANSCRIPCIONES)
     carpeta_partes = subcarpeta(drive, carpeta_trans, NOMBRE_PARTES)
-
-    audios = sorted(
-        (i for i in listar(drive, carpeta_id) if i["mimeType"] != "application/vnd.google-apps.folder" and es_audio(i)),
-        key=lambda i: i["name"],
-    )
+    audios = []
     for item in listar(drive, carpeta_id):
-        if item["mimeType"] not in ("application/vnd.google-apps.folder", "application/vnd.google-apps.shortcut") and not es_audio(item):
+        if item["mimeType"] in ("application/vnd.google-apps.folder", "application/vnd.google-apps.shortcut"):
+            continue
+        if es_audio(item):
+            audios.append(item)
+        else:
             log(f"[{materia}] salteo '{item['name']}' (tipo {item['mimeType']}, no parece audio).")
+    return {"materia": materia, "trans": carpeta_trans, "partes": carpeta_partes, "audios": audios}
 
-    for audio in audios:
+
+def resumir_pendientes(drive, api_key, m):
+    """Fase 1: resumir toda transcripción que todavía no tenga resumen."""
+    existentes = archivos_por_nombre(drive, m["trans"])
+    for audio in m["audios"]:
         if tiempo_agotado():
             return
         base = nombre_base(audio["name"])
-        existentes = archivos_por_nombre(drive, carpeta_trans)
-
-        if base not in existentes:
-            if ESTADO["sin_cuota_transcripcion"]:
-                continue  # hoy ya no se puede transcribir; los resúmenes sí siguen
+        if base in existentes and base + SUFIJO_RESUMEN not in existentes:
             try:
-                if not transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_partes):
-                    return
-            except CuotaDiariaAgotada as e:
-                ESTADO["sin_cuota_transcripcion"] = True
-                log(f"{e} No se transcribe más hasta que se renueve la cuota; los resúmenes pendientes siguen.")
-                continue
-            except Exception as e:  # noqa: BLE001 - seguir con el resto aunque uno falle
-                log(f"[{materia}] {base}: ERROR al transcribir: {e}")
-                continue
-            existentes = archivos_por_nombre(drive, carpeta_trans)
-
-        if base + SUFIJO_RESUMEN not in existentes and base in existentes:
-            try:
-                resumir(drive, api_key, materia, base, existentes[base], carpeta_trans)
+                resumir(drive, api_key, m["materia"], base, existentes[base], m["trans"])
             except Exception as e:  # noqa: BLE001
-                log(f"[{materia}] {base}: ERROR al resumir: {e}")
+                log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
+
+
+def transcribir_pendientes(drive, api_key, m):
+    """Fase 2: transcribir audios sin transcripción (y resumirlos si hay tiempo).
+
+    Los pendientes se procesan en orden aleatorio para que un audio
+    problemático no se lleve siempre el primer intento (y la cuota) de
+    cada corrida.
+    """
+    existentes = archivos_por_nombre(drive, m["trans"])
+    pendientes = [a for a in m["audios"] if nombre_base(a["name"]) not in existentes]
+    random.shuffle(pendientes)
+    if pendientes:
+        log(f"[{m['materia']}] {len(pendientes)} audio(s) sin transcribir: {', '.join(nombre_base(a['name']) for a in pendientes)}")
+
+    for audio in pendientes:
+        if tiempo_agotado() or ESTADO["sin_cuota_transcripcion"]:
+            return
+        base = nombre_base(audio["name"])
+        try:
+            if not transcribir_audio(drive, api_key, m["materia"], audio, m["trans"], m["partes"]):
+                return
+        except CuotaDiariaAgotada as e:
+            ESTADO["sin_cuota_transcripcion"] = True
+            log(f"{e} No se transcribe más hasta que se renueve la cuota.")
+            return
+        except Exception as e:  # noqa: BLE001 - seguir con el resto aunque uno falle
+            log(f"[{m['materia']}] {base}: ERROR al transcribir: {e}")
+            continue
+
+        # Recién transcripta: resumirla ya, si queda tiempo
+        nuevos = archivos_por_nombre(drive, m["trans"])
+        if base in nuevos and not tiempo_agotado():
+            try:
+                resumir(drive, api_key, m["materia"], base, nuevos[base], m["trans"])
+            except Exception as e:  # noqa: BLE001
+                log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
 
 
 def main():
@@ -507,14 +537,29 @@ def main():
     materias = obtener_materias(drive, env("CARPETA_CLASES_ID"))
     log(f"Materias: {', '.join(m for m, _ in materias) or 'ninguna'}")
 
+    preparadas = []
     for nombre, carpeta_id in materias:
+        try:
+            preparadas.append(preparar_materia(drive, nombre, carpeta_id))
+        except Exception as e:  # noqa: BLE001
+            log(f"[{nombre}] ERROR al leer la materia: {e}. La salteo en esta corrida.")
+
+    # Fase 1: resúmenes pendientes (rápidos, usan otros modelos que la transcripción)
+    for m in preparadas:
+        try:
+            resumir_pendientes(drive, api_key, m)
+        except Exception as e:  # noqa: BLE001
+            log(f"[{m['materia']}] ERROR inesperado en resúmenes: {e}")
+
+    # Fase 2: transcripciones pendientes
+    for m in preparadas:
         if tiempo_agotado():
             log("Tiempo de la corrida agotado; lo pendiente sigue en la próxima.")
             break
         try:
-            procesar_materia(drive, api_key, nombre, carpeta_id)
-        except Exception as e:  # noqa: BLE001 - seguir con las demás materias
-            log(f"[{nombre}] ERROR inesperado: {e}. Sigo con la próxima materia.")
+            transcribir_pendientes(drive, api_key, m)
+        except Exception as e:  # noqa: BLE001
+            log(f"[{m['materia']}] ERROR inesperado en transcripciones: {e}")
 
     log("Fin de la corrida.")
 
