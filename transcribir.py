@@ -13,7 +13,8 @@ accesos directos). Para cada audio de clase:
   2. Si tiene transcripción pero no resumen: genera un resumen reestructurado
      con un modelo de texto de Gemini y lo guarda como "<nombre> - resumen".
 
-Todo se guarda en la subcarpeta "Transcripciones" de cada materia.
+Transcripción y resumen se guardan como Google Docs en la subcarpeta
+"Transcripciones" de cada materia.
 
 Variables de entorno necesarias (en GitHub van como secretos):
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN,
@@ -108,6 +109,7 @@ TRANSCRIPCIÓN:
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 INICIO = time.time()
+ESTADO = {"sin_cuota_transcripcion": False}
 
 
 def log(msg):
@@ -198,20 +200,26 @@ def bajar(drive, archivo_id, destino):
             _, terminado = dl.next_chunk()
 
 
-def leer_texto(drive, archivo_id):
+def leer_texto(drive, item):
+    """Lee el texto de un archivo de texto plano o de un Google Doc."""
+    if item["mimeType"] == "application/vnd.google-apps.document":
+        req = drive.files().export_media(fileId=item["id"], mimeType="text/plain")
+    else:
+        req = drive.files().get_media(fileId=item["id"], supportsAllDrives=True)
     buf = io.BytesIO()
-    req = drive.files().get_media(fileId=archivo_id, supportsAllDrives=True)
     dl = MediaIoBaseDownload(buf, req)
     terminado = False
     while not terminado:
         _, terminado = dl.next_chunk()
-    return buf.getvalue().decode("utf-8")
+    return buf.getvalue().decode("utf-8-sig")
 
 
-def guardar_texto(drive, carpeta_id, nombre, texto):
-    media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype="text/plain", resumable=False)
+def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False):
+    """Guarda un texto en Drive; con como_doc=True lo convierte en Google Doc."""
+    media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype="text/plain", resumable=True)
+    tipo = "application/vnd.google-apps.document" if como_doc else "text/plain"
     drive.files().create(
-        body={"name": nombre, "parents": [carpeta_id], "mimeType": "text/plain"},
+        body={"name": nombre, "parents": [carpeta_id], "mimeType": tipo},
         media_body=media,
         fields="id",
         supportsAllDrives=True,
@@ -276,10 +284,16 @@ class ErrorReintentable(Exception):
     pass
 
 
+class CuotaDiariaAgotada(Exception):
+    """Se terminó la cuota diaria de Gemini: no tiene sentido seguir hoy."""
+
+
 def revisar_respuesta(r, contexto):
     if r.status_code == 200:
         return
     detalle = r.text[:500]
+    if r.status_code == 429 and "PerDay" in r.text:
+        raise CuotaDiariaAgotada(f"{contexto}: cuota diaria de Gemini agotada.")
     if r.status_code == 429 or r.status_code >= 500:
         raise ErrorReintentable(f"{contexto} respondió {r.status_code}")
     raise RuntimeError(f"{contexto} respondió {r.status_code}: {detalle}")
@@ -408,17 +422,17 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
 
     # Todos los tramos listos: unir, guardar y limpiar
     partes = archivos_por_nombre(drive, carpeta_partes)
-    textos = [leer_texto(drive, partes[n]["id"]).strip() for n in nombres_partes]
-    guardar_texto(drive, carpeta_trans, base, "\n\n".join(textos))
+    textos = [leer_texto(drive, partes[n]).strip() for n in nombres_partes]
+    guardar_texto(drive, carpeta_trans, base, "\n\n".join(textos), como_doc=True)
     for n in nombres_partes:
         a_papelera(drive, partes[n]["id"])
     log(f"{etiqueta}: transcripción completa guardada.")
     return True
 
 
-def resumir(drive, api_key, materia, base, transcripcion_id, carpeta_trans):
+def resumir(drive, api_key, materia, base, transcripcion, carpeta_trans):
     etiqueta = f"[{materia}] {base}"
-    texto = leer_texto(drive, transcripcion_id)
+    texto = leer_texto(drive, transcripcion)
     prompt = PROMPT_RESUMEN.format(materia=materia, clase=base, transcripcion=texto)
 
     ultimo_error = None
@@ -427,10 +441,11 @@ def resumir(drive, api_key, materia, base, transcripcion_id, carpeta_trans):
             break
         try:
             resumen = generar(api_key, modelo, [{"text": prompt}], f"resumen de {base}")
-            guardar_texto(drive, carpeta_trans, base + SUFIJO_RESUMEN, resumen)
+            guardar_texto(drive, carpeta_trans, base + SUFIJO_RESUMEN, resumen, como_doc=True)
             log(f"{etiqueta}: resumen guardado (con {modelo}).")
             return
-        except (ErrorReintentable, RuntimeError) as e:
+        except (ErrorReintentable, RuntimeError, CuotaDiariaAgotada) as e:
+            # La cuota es por modelo: si uno la agotó, otro puede tener.
             ultimo_error = e
             log(f"{etiqueta}: {modelo} no pudo con el resumen ({e}); pruebo el siguiente.")
     log(f"{etiqueta}: resumen pendiente para la próxima corrida. Último error: {ultimo_error}")
@@ -455,9 +470,15 @@ def procesar_materia(drive, api_key, materia, carpeta_id):
         existentes = archivos_por_nombre(drive, carpeta_trans)
 
         if base not in existentes:
+            if ESTADO["sin_cuota_transcripcion"]:
+                continue  # hoy ya no se puede transcribir; los resúmenes sí siguen
             try:
                 if not transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_partes):
                     return
+            except CuotaDiariaAgotada as e:
+                ESTADO["sin_cuota_transcripcion"] = True
+                log(f"{e} No se transcribe más hasta que se renueve la cuota; los resúmenes pendientes siguen.")
+                continue
             except Exception as e:  # noqa: BLE001 - seguir con el resto aunque uno falle
                 log(f"[{materia}] {base}: ERROR al transcribir: {e}")
                 continue
@@ -465,7 +486,7 @@ def procesar_materia(drive, api_key, materia, carpeta_id):
 
         if base + SUFIJO_RESUMEN not in existentes and base in existentes:
             try:
-                resumir(drive, api_key, materia, base, existentes[base]["id"], carpeta_trans)
+                resumir(drive, api_key, materia, base, existentes[base], carpeta_trans)
             except Exception as e:  # noqa: BLE001
                 log(f"[{materia}] {base}: ERROR al resumir: {e}")
 
