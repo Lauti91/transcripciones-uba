@@ -63,6 +63,13 @@ MAX_MINUTOS_CORRIDA = 45
 
 MIN_CARACTERES = 200
 
+# Reintentos automáticos de las llamadas a Drive ante cortes de conexión.
+REINTENTOS_DRIVE = 5
+
+# Tiempo máximo de espera por pedido a Gemini. Si se cumple, se trata como
+# saturación y se reintenta (un tramo de 40 min suele tardar 1-2 min).
+TIMEOUT_GEMINI_S = 300
+
 EXTENSIONES_AUDIO = {"m4a", "mp3", "wav", "ogg", "oga", "opus", "aac", "flac", "amr", "webm", "3gp", "mp4"}
 
 PROMPT_TRANSCRIBIR = (
@@ -154,7 +161,7 @@ def listar(drive, carpeta_id):
             pageToken=token,
             supportsAllDrives=True,
             includeItemsFromAllDrives=True,
-        ).execute()
+        ).execute(num_retries=REINTENTOS_DRIVE)
         items += r.get("files", [])
         token = r.get("nextPageToken")
         if not token:
@@ -183,7 +190,7 @@ def subcarpeta(drive, padre_id, nombre):
         body={"name": nombre, "mimeType": "application/vnd.google-apps.folder", "parents": [padre_id]},
         fields="id",
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=REINTENTOS_DRIVE)
     return nueva["id"]
 
 
@@ -197,7 +204,7 @@ def bajar(drive, archivo_id, destino):
         dl = MediaIoBaseDownload(f, req, chunksize=32 * 1024 * 1024)
         terminado = False
         while not terminado:
-            _, terminado = dl.next_chunk()
+            _, terminado = dl.next_chunk(num_retries=REINTENTOS_DRIVE)
 
 
 def leer_texto(drive, item):
@@ -210,7 +217,7 @@ def leer_texto(drive, item):
     dl = MediaIoBaseDownload(buf, req)
     terminado = False
     while not terminado:
-        _, terminado = dl.next_chunk()
+        _, terminado = dl.next_chunk(num_retries=REINTENTOS_DRIVE)
     return buf.getvalue().decode("utf-8-sig")
 
 
@@ -223,11 +230,11 @@ def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False):
         media_body=media,
         fields="id",
         supportsAllDrives=True,
-    ).execute()
+    ).execute(num_retries=REINTENTOS_DRIVE)
 
 
 def a_papelera(drive, archivo_id):
-    drive.files().update(fileId=archivo_id, body={"trashed": True}, supportsAllDrives=True).execute()
+    drive.files().update(fileId=archivo_id, body={"trashed": True}, supportsAllDrives=True).execute(num_retries=REINTENTOS_DRIVE)
 
 
 def es_audio(item):
@@ -295,7 +302,7 @@ def revisar_respuesta(r, contexto):
     if r.status_code == 429 and "PerDay" in r.text:
         raise CuotaDiariaAgotada(f"{contexto}: cuota diaria de Gemini agotada.")
     if r.status_code == 429 or r.status_code >= 500:
-        raise ErrorReintentable(f"{contexto} respondió {r.status_code}")
+        raise ErrorReintentable(f"respondió {r.status_code}")
     raise RuntimeError(f"{contexto} respondió {r.status_code}: {detalle}")
 
 
@@ -357,16 +364,19 @@ def extraer_texto(json_resp):
 
 def generar(api_key, modelo, parts, contexto):
     def _llamar():
-        r = requests.post(
-            f"{GEMINI_BASE}/v1beta/models/{modelo}:generateContent?key={api_key}",
-            json={"contents": [{"parts": parts}]},
-            timeout=900,
-        )
+        try:
+            r = requests.post(
+                f"{GEMINI_BASE}/v1beta/models/{modelo}:generateContent?key={api_key}",
+                json={"contents": [{"parts": parts}]},
+                timeout=TIMEOUT_GEMINI_S,
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            raise ErrorReintentable(f"sin respuesta ({type(e).__name__})") from e
         revisar_respuesta(r, f"{modelo} ({contexto})")
         texto, fin = extraer_texto(r.json())
         if len(texto.strip()) < MIN_CARACTERES:
             # Respuesta vacía: suele ser algo transitorio, se reintenta.
-            raise ErrorReintentable(f"{modelo} devolvió {len(texto.strip())} caracteres (finishReason: {fin})")
+            raise ErrorReintentable(f"devolvió {len(texto.strip())} caracteres (finishReason: {fin})")
         if fin == "MAX_TOKENS":
             log(f"AVISO: {modelo} cortó la salida por límite de tokens ({contexto}); puede estar incompleta.")
         return texto
@@ -501,7 +511,10 @@ def main():
         if tiempo_agotado():
             log("Tiempo de la corrida agotado; lo pendiente sigue en la próxima.")
             break
-        procesar_materia(drive, api_key, nombre, carpeta_id)
+        try:
+            procesar_materia(drive, api_key, nombre, carpeta_id)
+        except Exception as e:  # noqa: BLE001 - seguir con las demás materias
+            log(f"[{nombre}] ERROR inesperado: {e}. Sigo con la próxima materia.")
 
     log("Fin de la corrida.")
 
