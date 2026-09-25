@@ -74,6 +74,9 @@ REINTENTOS_DRIVE = 5
 # saturación y se reintenta (un tramo de 40 min suele tardar 1-2 min).
 TIMEOUT_GEMINI_S = 300
 
+# Pausa entre tramos consecutivos, para no superar el límite de tokens por minuto.
+PAUSA_ENTRE_TRAMOS_S = 60
+
 EXTENSIONES_AUDIO = {"m4a", "mp3", "wav", "ogg", "oga", "opus", "aac", "flac", "amr", "webm", "3gp", "mp4"}
 
 PROMPT_TRANSCRIBIR = (
@@ -286,13 +289,37 @@ def con_reintentos(descripcion, funcion):
         except ErrorReintentable as e:
             if intento == MAX_REINTENTOS or tiempo_agotado():
                 raise
-            log(f"{descripcion}: {e} -> reintento {intento}/{MAX_REINTENTOS - 1} en {espera}s")
-            time.sleep(espera)
+            pausa = max(espera, math.ceil(e.espera) + 5) if e.espera else espera
+            log(f"{descripcion}: {e} -> reintento {intento}/{MAX_REINTENTOS - 1} en {pausa}s")
+            time.sleep(pausa)
             espera = min(espera * 2, ESPERA_MAXIMA_S)
 
 
 class ErrorReintentable(Exception):
-    pass
+    """Error transitorio. 'espera' = segundos sugeridos por la API antes de reintentar."""
+
+    def __init__(self, mensaje, espera=None):
+        super().__init__(mensaje)
+        self.espera = espera
+
+
+def analizar_429(r):
+    """Devuelve (límites violados, segundos sugeridos de espera) de un 429 de Gemini.
+
+    Un 429 puede listar varios límites a la vez (por minuto y por día), así
+    que solo se considera "cuota diaria agotada" si TODOS son diarios.
+    """
+    limites, espera = [], None
+    try:
+        for d in r.json().get("error", {}).get("details", []):
+            tipo = d.get("@type", "")
+            if tipo.endswith("QuotaFailure"):
+                limites += [v.get("quotaId", "") for v in d.get("violations", [])]
+            elif tipo.endswith("RetryInfo"):
+                espera = float(str(d.get("retryDelay", "0s")).rstrip("s") or 0)
+    except ValueError:
+        pass
+    return sorted(set(q for q in limites if q)), espera
 
 
 class CuotaDiariaAgotada(Exception):
@@ -303,9 +330,12 @@ def revisar_respuesta(r, contexto):
     if r.status_code == 200:
         return
     detalle = r.text[:500]
-    if r.status_code == 429 and "PerDay" in r.text:
-        raise CuotaDiariaAgotada(f"{contexto}: cuota diaria de Gemini agotada.")
-    if r.status_code == 429 or r.status_code >= 500:
+    if r.status_code == 429:
+        limites, espera = analizar_429(r)
+        if limites and all("PerDay" in q for q in limites):
+            raise CuotaDiariaAgotada(f"{contexto}: cuota diaria de Gemini agotada ({', '.join(limites)}).")
+        raise ErrorReintentable(f"respondió 429 ({', '.join(limites) or 'límite de uso'})", espera=espera)
+    if r.status_code >= 500:
         raise ErrorReintentable(f"respondió {r.status_code}")
     raise RuntimeError(f"{contexto} respondió {r.status_code}: {detalle}")
 
@@ -433,6 +463,9 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
             guardar_texto(drive, carpeta_partes, nombre_parte, texto)
             partes_existentes[nombre_parte] = True
             log(f"{etiqueta}: tramo {i + 1}/{total} OK ({len(texto)} caracteres).")
+            if i + 1 < total:
+                # Cada tramo son ~77.000 tokens: pausa para no pasar el límite por minuto.
+                time.sleep(PAUSA_ENTRE_TRAMOS_S)
 
     # Todos los tramos listos: unir, guardar y limpiar
     partes = archivos_por_nombre(drive, carpeta_partes)
