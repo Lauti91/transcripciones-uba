@@ -1,11 +1,12 @@
 """
-Transcripciones UBA: Drive -> Gemini -> Drive
+Transcripciones UBA: Drive -> Groq (Whisper) / Gemini -> Drive
 
 Recorre las materias dentro de la carpeta CLASES de Google Drive (carpetas o
 accesos directos). Para cada audio de clase:
 
-  1. Si no tiene transcripción: lo baja, lo parte en tramos de 40 minutos con
-     ffmpeg y transcribe cada tramo con gemini-3.5-transcribe (que acepta
+  1. Si no tiene transcripción: lo baja, lo parte en tramos de hasta 45 minutos
+     con ffmpeg y transcribe cada tramo con Groq (whisper-large-v3). Si Groq
+     falla o no tiene cuota, usa gemini-3.5-transcribe como respaldo (acepta
      hasta ~50 min por pedido). Cada tramo terminado se guarda en
      Transcripciones/_partes, así que si una corrida se corta, la siguiente
      retoma desde el tramo que falta. Al final une los tramos y guarda la
@@ -19,6 +20,10 @@ Transcripción y resumen se guardan como Google Docs en la subcarpeta
 Variables de entorno necesarias (en GitHub van como secretos):
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN,
   GEMINI_API_KEY, CARPETA_CLASES_ID
+Opcionales:
+  GROQ_API_KEY (sin ella se transcribe solo con Gemini),
+  CARPETA_RESUMENES_SPARK_ID (sin ella se saltea la fase 0),
+  PRUEBA_GROQ_MATERIA + PRUEBA_GROQ_AUDIO (modo de prueba, ver prueba_groq).
 """
 
 import io
@@ -26,10 +31,12 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 import requests
@@ -47,7 +54,16 @@ NOMBRE_RESUMENES = "Resúmenes de clase"   # dentro de cada materia (visible par
 SUFIJO_RESUMEN_SPARK = " - Resumen de clase"
 SUFIJO_RESUMEN = " - resumen"
 
-MODELO_TRANSCRIPCION = "gemini-3.5-transcribe"
+MODELO_TRANSCRIPCION = "gemini-3.5-transcribe"   # respaldo si Groq falla
+
+# Transcriptor principal: Groq (API compatible con OpenAI).
+GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+MODELO_GROQ = "whisper-large-v3"
+MAX_BYTES_GROQ = 25 * 1024 * 1024   # límite de archivo de Groq
+TIMEOUT_GROQ_S = 300
+# Si Groq pide esperar más que esto (ej. límite por hora), se usa Gemini.
+MAX_ESPERA_GROQ_S = 180
+SUFIJO_PRUEBA_GROQ = " (groq)"
 # Para el resumen: si uno está saturado, se prueba el siguiente.
 MODELOS_RESUMEN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
 
@@ -132,7 +148,7 @@ TRANSCRIPCIÓN:
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 INICIO = time.time()
-ESTADO = {"sin_cuota_transcripcion": False}
+ESTADO = {"sin_cuota_gemini": False, "sin_cuota_groq": False}
 
 
 def log(msg):
@@ -428,12 +444,158 @@ def generar(api_key, modelo, parts, contexto):
 
 
 # ---------------------------------------------------------------------------
+# Groq (Whisper)
+# ---------------------------------------------------------------------------
+
+class SinCuotaGroq(Exception):
+    """Groq agotó su cuota (diaria, o por hora con espera larga): usar Gemini."""
+
+
+def segundos_espera_groq(r):
+    """Segundos que Groq pide esperar (header retry-after o texto 'try again in 1m2.5s')."""
+    try:
+        return float(r.headers.get("retry-after"))
+    except (TypeError, ValueError):
+        pass
+    try:
+        mensaje = r.json().get("error", {}).get("message", "")
+    except ValueError:
+        return None
+    m = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", mensaje)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, se = (float(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def revisar_respuesta_groq(r, contexto):
+    if r.status_code == 200:
+        return
+    if r.status_code == 429:
+        try:
+            mensaje = r.json().get("error", {}).get("message", "")
+        except ValueError:
+            mensaje = r.text[:300]
+        espera = segundos_espera_groq(r)
+        if "per day" in mensaje.lower() or "(ASPD)" in mensaje or "(RPD)" in mensaje:
+            raise SinCuotaGroq(f"{contexto}: cuota diaria de Groq agotada.")
+        if espera is not None and espera > MAX_ESPERA_GROQ_S:
+            raise SinCuotaGroq(f"{contexto}: Groq pide esperar {espera / 60:.0f} min (límite de uso).")
+        raise ErrorReintentable("respondió 429 (límite de uso)", espera=espera)
+    if r.status_code >= 500:
+        raise ErrorReintentable(f"respondió {r.status_code}")
+    raise RuntimeError(f"{contexto} respondió {r.status_code}: {r.text[:500]}")
+
+
+def quitar_repeticiones(texto, minimo=4):
+    """Whisper a veces repite la misma frase en silencios largos: deja una sola.
+
+    Solo colapsa frases idénticas consecutivas repetidas 'minimo' veces o más.
+    Devuelve (texto, cantidad de frases quitadas).
+    """
+    frases = re.split(r"(?<=[.!?…])\s+", texto.strip())
+    salida, quitadas, i = [], 0, 0
+    while i < len(frases):
+        j = i
+        while j + 1 < len(frases) and frases[j + 1].strip().lower() == frases[i].strip().lower():
+            j += 1
+        repeticiones = j - i + 1
+        salida.append(frases[i])
+        if repeticiones < minimo:
+            salida += frases[i + 1:j + 1]
+        else:
+            quitadas += repeticiones - 1
+        i = j + 1
+    return " ".join(salida), quitadas
+
+
+def transcribir_con_groq(groq_key, ruta, contexto):
+    tamano = os.path.getsize(ruta)
+    if tamano > MAX_BYTES_GROQ:
+        raise RuntimeError(f"{contexto}: el tramo pesa {tamano / 1024 / 1024:.1f} MB (Groq acepta hasta 25 MB).")
+
+    def _llamar():
+        try:
+            with open(ruta, "rb") as f:
+                r = requests.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {groq_key}"},
+                    files={"file": (Path(ruta).name, f, "audio/mpeg")},
+                    data={"model": MODELO_GROQ, "language": "es", "response_format": "text", "temperature": "0"},
+                    timeout=TIMEOUT_GROQ_S,
+                )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            raise ErrorReintentable(f"sin respuesta ({type(e).__name__})") from e
+        revisar_respuesta_groq(r, f"Groq ({contexto})")
+        texto = r.text.strip()
+        if len(texto) < MIN_CARACTERES:
+            raise ErrorReintentable(f"devolvió {len(texto)} caracteres")
+        texto, quitadas = quitar_repeticiones(texto)
+        if quitadas:
+            log(f"AVISO: Groq repitió frases ({contexto}); quité {quitadas} repetición(es).")
+        return texto
+
+    return con_reintentos(f"Groq ({contexto})", _llamar)
+
+
+def transcribir_con_gemini(api_key, ruta, contexto):
+    archivo_gemini = subir_a_gemini(api_key, ruta)
+    try:
+        return generar(
+            api_key,
+            MODELO_TRANSCRIPCION,
+            [{"text": PROMPT_TRANSCRIBIR},
+             {"file_data": {"mime_type": archivo_gemini["mimeType"], "file_uri": archivo_gemini["uri"]}}],
+            contexto,
+        )
+    finally:
+        borrar_de_gemini(api_key, archivo_gemini["name"])
+
+
+def transcribir_tramo(claves, ruta, contexto, solo_groq=False):
+    """Transcribe un tramo con Groq y, si falla, con Gemini. Devuelve (texto, motor)."""
+    groq_key = claves.get("groq")
+    if groq_key and not ESTADO["sin_cuota_groq"]:
+        try:
+            return transcribir_con_groq(groq_key, ruta, contexto), "groq"
+        except SinCuotaGroq as e:
+            ESTADO["sin_cuota_groq"] = True
+            if solo_groq:
+                raise
+            log(f"{e} Sigo con Gemini en esta corrida.")
+        except Exception as e:  # noqa: BLE001
+            if solo_groq:
+                raise
+            log(f"Groq falló ({contexto}): {e}. Pruebo con Gemini.")
+    elif solo_groq:
+        raise RuntimeError("Modo de prueba: falta GROQ_API_KEY o Groq no tiene cuota.")
+
+    if ESTADO["sin_cuota_gemini"]:
+        raise CuotaDiariaAgotada(f"{contexto}: Groq no disponible y cuota diaria de Gemini agotada.")
+    try:
+        return transcribir_con_gemini(claves["gemini"], ruta, contexto), "gemini"
+    except CuotaDiariaAgotada:
+        ESTADO["sin_cuota_gemini"] = True
+        raise
+
+
+def normalizar(nombre):
+    """Para comparar nombres ignorando tildes, mayúsculas y espacios de más."""
+    sin_tildes = "".join(
+        c for c in unicodedata.normalize("NFKD", nombre) if not unicodedata.combining(c)
+    )
+    return " ".join(sin_tildes.casefold().split())
+
+
+# ---------------------------------------------------------------------------
 # Procesamiento
 # ---------------------------------------------------------------------------
 
-def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_partes):
+def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_partes, salida=None, solo_groq=False):
+    """Transcribe un audio por tramos y guarda el Doc 'salida' (por defecto, el nombre del audio)."""
     base = nombre_base(audio["name"])
-    etiqueta = f"[{materia}] {base}"
+    salida = salida or base
+    etiqueta = f"[{materia}] {salida}"
 
     with tempfile.TemporaryDirectory() as tmp:
         ruta = Path(tmp) / "audio_original"
@@ -446,7 +608,7 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
         log(f"{etiqueta}: {duracion / 60:.0f} min -> {total} tramo(s) de ~{largo / 60:.0f} min.")
 
         partes_existentes = archivos_por_nombre(drive, carpeta_partes)
-        nombres_partes = [f"{base} - parte {i + 1} de {total}" for i in range(total)]
+        nombres_partes = [f"{salida} - parte {i + 1} de {total}" for i in range(total)]
 
         for i, nombre_parte in enumerate(nombres_partes):
             if nombre_parte in partes_existentes:
@@ -458,29 +620,19 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
 
             tramo = Path(tmp) / f"tramo_{i + 1}.mp3"
             extraer_tramo(ruta, i * (largo - 1), largo, tramo)
-            archivo_gemini = subir_a_gemini(api_key, tramo)
-            try:
-                texto = generar(
-                    api_key,
-                    MODELO_TRANSCRIPCION,
-                    [{"text": PROMPT_TRANSCRIBIR},
-                     {"file_data": {"mime_type": archivo_gemini["mimeType"], "file_uri": archivo_gemini["uri"]}}],
-                    f"{base}, tramo {i + 1}/{total}",
-                )
-            finally:
-                borrar_de_gemini(api_key, archivo_gemini["name"])
+            texto, motor = transcribir_tramo(claves, tramo, f"{salida}, tramo {i + 1}/{total}", solo_groq)
 
             guardar_texto(drive, carpeta_partes, nombre_parte, texto)
             partes_existentes[nombre_parte] = True
-            log(f"{etiqueta}: tramo {i + 1}/{total} OK ({len(texto)} caracteres).")
-            if i + 1 < total:
-                # Cada tramo son ~77.000 tokens: pausa para no pasar el límite por minuto.
+            log(f"{etiqueta}: tramo {i + 1}/{total} OK con {motor} ({len(texto)} caracteres).")
+            if motor == "gemini" and i + 1 < total:
+                # Cada tramo son ~77.000 tokens: pausa para no pasar el límite por minuto de Gemini.
                 time.sleep(PAUSA_ENTRE_TRAMOS_S)
 
     # Todos los tramos listos: unir, guardar y limpiar
     partes = archivos_por_nombre(drive, carpeta_partes)
     textos = [leer_texto(drive, partes[n]).strip() for n in nombres_partes]
-    guardar_texto(drive, carpeta_trans, base, "\n\n".join(textos), como_doc=True)
+    guardar_texto(drive, carpeta_trans, salida, "\n\n".join(textos), como_doc=True)
     for n in nombres_partes:
         a_papelera(drive, partes[n]["id"])
     log(f"{etiqueta}: transcripción completa guardada.")
@@ -537,7 +689,12 @@ def resumir_pendientes(drive, api_key, m):
                 log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
 
 
-def transcribir_pendientes(drive, api_key, m):
+def sin_transcriptor():
+    """True si ni Groq ni Gemini pueden transcribir más en esta corrida."""
+    return ESTADO["sin_cuota_gemini"] and ESTADO["sin_cuota_groq"]
+
+
+def transcribir_pendientes(drive, claves, m):
     """Fase 2: transcribir audios sin transcripción (y resumirlos si hay tiempo).
 
     Los pendientes se procesan en orden aleatorio para que un audio
@@ -551,16 +708,19 @@ def transcribir_pendientes(drive, api_key, m):
         log(f"[{m['materia']}] {len(pendientes)} audio(s) sin transcribir: {', '.join(nombre_base(a['name']) for a in pendientes)}")
 
     for audio in pendientes:
-        if tiempo_agotado() or ESTADO["sin_cuota_transcripcion"]:
+        if tiempo_agotado() or sin_transcriptor():
             return
         base = nombre_base(audio["name"])
         try:
-            if not transcribir_audio(drive, api_key, m["materia"], audio, m["trans"], m["partes"]):
+            if not transcribir_audio(drive, claves, m["materia"], audio, m["trans"], m["partes"]):
                 return
         except CuotaDiariaAgotada as e:
-            ESTADO["sin_cuota_transcripcion"] = True
-            log(f"{e} No se transcribe más hasta que se renueve la cuota.")
-            return
+            ESTADO["sin_cuota_gemini"] = True
+            if sin_transcriptor():
+                log(f"{e} Sin Groq ni Gemini: no se transcribe más hasta que se renueve la cuota.")
+                return
+            log(f"[{m['materia']}] {base}: {e} Sigo con el próximo audio.")
+            continue
         except Exception as e:  # noqa: BLE001 - seguir con el resto aunque uno falle
             log(f"[{m['materia']}] {base}: ERROR al transcribir: {e}")
             continue
@@ -569,7 +729,7 @@ def transcribir_pendientes(drive, api_key, m):
         nuevos = archivos_por_nombre(drive, m["trans"])
         if HACER_RESUMENES and base in nuevos and not tiempo_agotado():
             try:
-                resumir(drive, api_key, m["materia"], base, nuevos[base], m["trans"])
+                resumir(drive, claves["gemini"], m["materia"], base, nuevos[base], m["trans"])
             except Exception as e:  # noqa: BLE001
                 log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
 
@@ -578,51 +738,103 @@ def copiar_resumenes_spark(drive, materias):
     """Fase 0: copiar los resúmenes que Gemini Spark dejó en su carpeta privada.
 
     Spark escribe en una carpeta SIN compartir (así no pide confirmación):
-      RESÚMENES SPARK/<materia>/"dd-mm - Resumen de clase"
+      CLASES GRABDAS/<materia>/"dd-mm - Resumen de clase"
     Este paso los copia a CLASES/<materia>/Resúmenes de clase, que sí ve Claude.
-    Se activa definiendo CARPETA_RESUMENES_SPARK_ID (ID de "RESÚMENES SPARK").
+    Se activa definiendo CARPETA_RESUMENES_SPARK_ID (ID de "CLASES GRABDAS").
+    Las subcarpetas se emparejan con las materias ignorando tildes y
+    mayúsculas ("ECONOMETRIA II" = "Econometría II").
     """
     origen_raiz = os.environ.get("CARPETA_RESUMENES_SPARK_ID")
     if not origen_raiz:
         return
-    subcarpetas_spark = {
-        i["name"]: i["id"] for i in listar(drive, origen_raiz)
-        if i["mimeType"] == "application/vnd.google-apps.folder"
-    }
+    subcarpetas_spark = {}
+    for i in listar(drive, origen_raiz):
+        if i["mimeType"] == "application/vnd.google-apps.folder":
+            subcarpetas_spark.setdefault(normalizar(i["name"]), []).append(i["id"])
     for materia, carpeta_id in materias:
-        origen = subcarpetas_spark.get(materia)
-        if not origen:
-            continue
-        try:
-            resumenes = [
-                i for i in listar(drive, origen)
-                if i["mimeType"] == "application/vnd.google-apps.document" and i["name"].endswith(SUFIJO_RESUMEN_SPARK)
-            ]
-            if not resumenes:
-                continue
-            destino = subcarpeta(drive, carpeta_id, NOMBRE_RESUMENES)
-            ya_estan = archivos_por_nombre(drive, destino)
-            for r in resumenes:
-                if r["name"] in ya_estan:
+        for origen in subcarpetas_spark.get(normalizar(materia), []):
+            try:
+                resumenes = [
+                    i for i in listar(drive, origen)
+                    if i["mimeType"] == "application/vnd.google-apps.document" and i["name"].endswith(SUFIJO_RESUMEN_SPARK)
+                ]
+                if not resumenes:
                     continue
-                drive.files().copy(
-                    fileId=r["id"],
-                    body={"name": r["name"], "parents": [destino]},
-                    supportsAllDrives=True,
-                ).execute(num_retries=REINTENTOS_DRIVE)
-                log(f"[{materia}] copiado a '{NOMBRE_RESUMENES}': {r['name']}")
-        except Exception as e:  # noqa: BLE001
-            log(f"[{materia}] ERROR copiando resúmenes de Spark: {e}")
+                destino = subcarpeta(drive, carpeta_id, NOMBRE_RESUMENES)
+                ya_estan = archivos_por_nombre(drive, destino)
+                for r in resumenes:
+                    if r["name"] in ya_estan:
+                        continue
+                    drive.files().copy(
+                        fileId=r["id"],
+                        body={"name": r["name"], "parents": [destino]},
+                        supportsAllDrives=True,
+                    ).execute(num_retries=REINTENTOS_DRIVE)
+                    ya_estan[r["name"]] = r
+                    log(f"[{materia}] copiado a '{NOMBRE_RESUMENES}': {r['name']}")
+            except Exception as e:  # noqa: BLE001
+                log(f"[{materia}] ERROR copiando resúmenes de Spark: {e}")
+
+
+def prueba_groq(drive, claves, materias, materia_buscada, audio_buscado):
+    """Modo de prueba: transcribe un audio puntual SOLO con Groq.
+
+    Guarda el resultado como "<audio> (groq)" en Transcripciones, sin tocar la
+    transcripción existente ni usar Gemini. Si ya existe, no hace nada (borrar
+    ese Doc para repetir la prueba).
+    """
+    if not claves.get("groq"):
+        sys.exit("Modo de prueba: falta GROQ_API_KEY.")
+    carpeta_id = next((c for n, c in materias if normalizar(n) == normalizar(materia_buscada)), None)
+    if not carpeta_id:
+        sys.exit(f"Modo de prueba: no encontré la materia '{materia_buscada}'.")
+    materia = next(n for n, c in materias if c == carpeta_id)
+    m = preparar_materia(drive, materia, carpeta_id)
+    buscado = normalizar(nombre_base(audio_buscado))
+    audio = next((a for a in m["audios"] if normalizar(nombre_base(a["name"])) == buscado), None)
+    if not audio:
+        sys.exit(f"Modo de prueba: no encontré el audio '{audio_buscado}' en {materia}. "
+                 f"Audios: {', '.join(nombre_base(a['name']) for a in m['audios']) or 'ninguno'}")
+
+    salida = nombre_base(audio["name"]) + SUFIJO_PRUEBA_GROQ
+    if salida in archivos_por_nombre(drive, m["trans"]):
+        log(f"[{materia}] '{salida}' ya existe en {NOMBRE_TRANSCRIPCIONES}; no lo piso. Borralo para repetir la prueba.")
+        return
+    log(f"[{materia}] MODO PRUEBA: transcribo '{audio['name']}' solo con Groq -> '{salida}'.")
+    inicio = time.time()
+    try:
+        terminado = transcribir_audio(drive, claves, materia, audio, m["trans"], m["partes"], salida=salida, solo_groq=True)
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"[{materia}] MODO PRUEBA: Groq no pudo transcribir: {str(e).rstrip('.')}. "
+                 f"Los tramos ya hechos quedaron en {NOMBRE_PARTES}; volvé a correr la prueba para seguir.")
+    if terminado:
+        log(f"[{materia}] MODO PRUEBA: listo en {(time.time() - inicio) / 60:.1f} min. "
+            f"Compará '{salida}' con '{nombre_base(audio['name'])}'.")
 
 
 def main():
-    api_key = env("GEMINI_API_KEY")
     drive = conectar_drive()
     materias = obtener_materias(drive, env("CARPETA_CLASES_ID"))
+    claves = {"groq": os.environ.get("GROQ_API_KEY"), "gemini": os.environ.get("GEMINI_API_KEY")}
+
+    prueba_materia = os.environ.get("PRUEBA_GROQ_MATERIA", "").strip()
+    prueba_audio = os.environ.get("PRUEBA_GROQ_AUDIO", "").strip()
+    if prueba_materia or prueba_audio:
+        if not (prueba_materia and prueba_audio):
+            sys.exit("Modo de prueba: hacen falta la materia y el audio.")
+        prueba_groq(drive, claves, materias, prueba_materia, prueba_audio)
+        log("Fin de la corrida (modo prueba).")
+        return
+
+    claves["gemini"] = env("GEMINI_API_KEY")
+    if not claves["groq"]:
+        ESTADO["sin_cuota_groq"] = True
+        log("AVISO: falta GROQ_API_KEY; se transcribe solo con Gemini.")
     log(f"Materias: {', '.join(m for m, _ in materias) or 'ninguna'}"
+        f" | transcripción: {'Groq, con Gemini de respaldo' if claves['groq'] else 'Gemini'}"
         f" | resúmenes en este script: {'sí' if HACER_RESUMENES else 'no (los hace Gemini Spark)'}")
 
-    # Fase 0: copiar resúmenes de Spark (rápido, no usa Gemini)
+    # Fase 0: copiar resúmenes de Spark (rápido, no usa IA)
     copiar_resumenes_spark(drive, materias)
 
     preparadas = []
@@ -635,7 +847,7 @@ def main():
     # Fase 1: resúmenes pendientes (solo si están activados en este script)
     for m in (preparadas if HACER_RESUMENES else []):
         try:
-            resumir_pendientes(drive, api_key, m)
+            resumir_pendientes(drive, claves["gemini"], m)
         except Exception as e:  # noqa: BLE001
             log(f"[{m['materia']}] ERROR inesperado en resúmenes: {e}")
 
@@ -645,7 +857,7 @@ def main():
             log("Tiempo de la corrida agotado; lo pendiente sigue en la próxima.")
             break
         try:
-            transcribir_pendientes(drive, api_key, m)
+            transcribir_pendientes(drive, claves, m)
         except Exception as e:  # noqa: BLE001
             log(f"[{m['materia']}] ERROR inesperado en transcripciones: {e}")
 

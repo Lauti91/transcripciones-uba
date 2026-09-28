@@ -4,10 +4,21 @@ on:
   schedule:
     - cron: "*/30 * * * *"   # cada 30 minutos (hora UTC)
   workflow_dispatch:           # botón "Run workflow" para correrlo a mano
+    inputs:
+      prueba_groq_materia:
+        description: "MODO PRUEBA GROQ: materia (ej. DESARROLLO). Vacío = corrida normal."
+        required: false
+        default: ""
+      prueba_groq_audio:
+        description: "MODO PRUEBA GROQ: audio sin extensión (ej. 27-08). Se guarda como '<audio> (groq)'."
+        required: false
+        default: ""
 
-# Nunca dos corridas a la vez: si una sigue en curso, la nueva espera.
+# Nunca dos corridas normales a la vez: si una sigue en curso, la nueva espera.
+# El modo prueba va en otro grupo, así una corrida programada no lo cancela
+# mientras espera (solo escribe "<audio> (groq)", no pisa nada de la normal).
 concurrency:
-  group: transcribir
+  group: transcribir${{ inputs.prueba_groq_audio && '-prueba' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -34,6 +45,9 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           CARPETA_CLASES_ID: ${{ secrets.CARPETA_CLASES_ID }}
           CARPETA_RESUMENES_SPARK_ID: ${{ secrets.CARPETA_RESUMENES_SPARK_ID }}
+          PRUEBA_GROQ_MATERIA: ${{ inputs.prueba_groq_materia }}
+          PRUEBA_GROQ_AUDIO: ${{ inputs.prueba_groq_audio }}
         run: python transcribir.py
