@@ -35,4 +35,5 @@ jobs:
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CARPETA_CLASES_ID: ${{ secrets.CARPETA_CLASES_ID }}
+          CARPETA_RESUMENES_SPARK_ID: ${{ secrets.CARPETA_RESUMENES_SPARK_ID }}
         run: python transcribir.py
