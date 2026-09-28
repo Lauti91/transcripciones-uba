@@ -7,7 +7,7 @@ Sistema personal de Lautaro (Economía, FCE-UBA) que transcribe las clases que g
 ```
 Audio "dd-mm" en Drive (CLASES/<materia>/)
   -> transcribir.py (GitHub Actions, cada 30 min): transcribe y guarda Google Doc "dd-mm" en <materia>/Transcripciones
-  -> Gemini Spark (tarea programada en la app de Gemini, NO en este repo): resume y guarda en Mi unidad/RESÚMENES SPARK/<materia>/ "dd-mm - Resumen de clase"
+  -> Gemini Spark (tarea programada en la app de Gemini, NO en este repo): resume y guarda en Mi unidad/CLASES GRABDAS/<materia>/ "dd-mm - Resumen de clase" (carpeta SIN compartir, así Spark no pide confirmación)
   -> transcribir.py (fase 0): copia esos resúmenes a CLASES/<materia>/Resúmenes de clase
   -> Claude (tarea programada en el Proyecto de cada materia, fuera de este repo): suma los resúmenes al Proyecto
 ```
@@ -23,7 +23,7 @@ Este repo solo contiene la parte de Python. Spark y las tareas de Claude se conf
 
 ## Secretos (GitHub Actions)
 
-`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (OAuth de la cuenta p.lautaro.gonzalez, scope drive completo), `GEMINI_API_KEY`, `CARPETA_CLASES_ID` (1iUMt_XeQoU5h2TJQgNp5ETqoEfqLbe7f), `CARPETA_RESUMENES_SPARK_ID` (carpeta privada de Spark; si falta, la fase 0 se saltea). Nunca imprimir ni commitear secretos.
+`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (OAuth de la cuenta p.lautaro.gonzalez, scope drive completo), `GEMINI_API_KEY`, `CARPETA_CLASES_ID` (1iUMt_XeQoU5h2TJQgNp5ETqoEfqLbe7f), `CARPETA_RESUMENES_SPARK_ID` (ID de "CLASES GRABDAS", carpeta privada de Spark en la cuenta p.lautaro.gonzalez / paulogonzalito123, que son la misma; si falta, la fase 0 se saltea). Nunca imprimir ni commitear secretos.
 
 ## Cómo funciona transcribir.py
 
@@ -54,3 +54,4 @@ Groq ofrece whisper-large-v3 gratis: ~28.800 s de audio por día (8 h), 7.200 s 
 - Crear el secreto `CARPETA_RESUMENES_SPARK_ID` (lo crea Lautaro).
 - Regenerar el secreto del cliente OAuth (quedó expuesto en una captura) y actualizar `GOOGLE_CLIENT_SECRET`.
 - GitHub desactiva workflows programados tras 60 días sin commits en repos públicos.
+- Fase 0 empareja subcarpetas de "CLASES GRABDAS" con las materias de CLASES por nombre exacto. Mejora pendiente: normalizar tildes y mayúsculas al comparar (ej. "ECONOMETRIA II" vs "ECONOMETRÍA II"). Los resúmenes se COPIAN (no mover): Spark decide qué falta mirando su propia carpeta.
