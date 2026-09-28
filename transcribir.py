@@ -29,6 +29,7 @@ Opcionales:
   prueba, ver prueba_groq y prueba_correccion).
 """
 
+import csv
 import io
 import json
 import math
@@ -82,6 +83,13 @@ TOKENS_POR_PALABRA = 1.5   # estimación conservadora para español
 # Si el bloque corregido cambia mucho de largo, se descarta (usa el original).
 MIN_PROPORCION_CORRECCION = 0.85
 MAX_PROPORCION_CORRECCION = 1.15
+# Filtro de cada corrección propuesta: en palabras comunes, similitud mínima
+# (1 - Levenshtein / largo mayor, sin tildes ni mayúsculas) entre original y
+# corrección. Con 0,6 caen "bota → aborto" (0,50) y "dotes → dotaciones"
+# (0,50) y pasa "microqueditos → microcréditos" (0,85).
+UMBRAL_SIMILITUD = float(os.environ.get("UMBRAL_SIMILITUD", "0.6"))
+TABLA_GUIONES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-"})
+CARPETA_AUDITORIA = "auditoria"   # CSV local del modo prueba (el workflow lo sube como artefacto)
 SUFIJO_SIN_CORREGIR = " (sin corregir)"    # copia cruda, en _partes
 SUFIJO_PRUEBA_CORRECCION = " (corregida)"
 SEPARADOR_CORRECCIONES = "────────────────────"
@@ -97,7 +105,15 @@ Prohibido:
 - Resumir, acortar, reordenar, agregar contenido o explicaciones.
 - "Arreglar" frases ininteligibles o cortadas inventándoles sentido: dejalas exactamente como están.
 - Cambiar el registro oral o el voseo rioplatense (muletillas, repeticiones y frases coloquiales quedan como están).
+- Traducir términos: si se dijo en inglés, queda en inglés (ej. "Behavioral Economics" queda igual).
+- Expandir abreviaturas o siglas, o completar palabras cortadas (ej. "pol" queda "pol"; "PBG" queda "PBG").
+- Completar o alargar nombres (ej. "David" NO pasa a "David Weil").
+- Cambiar números o su formato (ej. "3" NO pasa a "tres", ni al revés).
+- Cambiar apodos o formas de trato que figuran en el glosario (ej. "Luz" queda "Luz").
+- Corregir un nombre propio o sigla si la forma corregida no está escrita en el glosario.
 - Corregir por adivinanza: si no hay evidencia clara, no toques la palabra.
+
+Ante la duda, dejá el original.
 
 Respondé SOLO con un objeto JSON con dos campos:
 {"texto": "<el bloque completo, corregido>", "correcciones": [{"original": "<como estaba>", "corregido": "<como quedó>"}]}
@@ -292,10 +308,10 @@ def leer_texto(drive, item):
     return buf.getvalue().decode("utf-8-sig")
 
 
-def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False):
+def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False, mime="text/plain"):
     """Guarda un texto en Drive; con como_doc=True lo convierte en Google Doc."""
-    media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype="text/plain", resumable=True)
-    tipo = "application/vnd.google-apps.document" if como_doc else "text/plain"
+    media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype=mime, resumable=True)
+    tipo = "application/vnd.google-apps.document" if como_doc else mime
     drive.files().create(
         body={"name": nombre, "parents": [carpeta_id], "mimeType": tipo},
         media_body=media,
@@ -629,6 +645,10 @@ class SinCuotaCorreccion(Exception):
 class BloqueDescartado(Exception):
     """La respuesta del corrector no es usable para ese bloque (se usa el original)."""
 
+    def __init__(self, mensaje, propuestas=None):
+        super().__init__(mensaje)
+        self.propuestas = propuestas or []
+
 
 def segundos_de_duracion(valor):
     """'1m2.5s', '7.66s', '150ms', '2' -> segundos (None si no se entiende)."""
@@ -763,7 +783,7 @@ def normalizar_correcciones(lista):
                 a, b = partes
         if isinstance(a, str) and isinstance(b, str) and a.strip() and b.strip() and a.strip() != b.strip():
             pares.append((a.strip(), b.strip()))
-    return pares
+    return list(dict.fromkeys(pares))
 
 
 def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
@@ -824,14 +844,130 @@ def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
         datos = json.loads(contenido)
     except (KeyError, IndexError, TypeError, ValueError) as e:
         raise BloqueDescartado(f"JSON ilegible ({type(e).__name__})") from e
+    propuestas = normalizar_correcciones(datos.get("correcciones")) if isinstance(datos, dict) else []
     texto = datos.get("texto") if isinstance(datos, dict) else None
     if not isinstance(texto, str) or not texto.strip():
-        raise BloqueDescartado("el JSON no trae 'texto'")
+        raise BloqueDescartado("el JSON no trae 'texto'", propuestas)
     texto = texto.strip()
     proporcion = len(texto) / max(1, len(bloque))
     if not MIN_PROPORCION_CORRECCION <= proporcion <= MAX_PROPORCION_CORRECCION:
-        raise BloqueDescartado(f"largo {proporcion:.0%} del original")
-    return texto, normalizar_correcciones(datos.get("correcciones"))
+        raise BloqueDescartado(f"largo {proporcion:.0%} del original", propuestas)
+    return texto, propuestas
+
+
+def normalizar_guiones(texto):
+    return texto.translate(TABLA_GUIONES)
+
+
+def forma_comparable(texto):
+    """Minúsculas, sin tildes y con guiones comunes (para comparar con el glosario)."""
+    return normalizar_guiones(normalizar(texto))
+
+
+def similitud(a, b):
+    """1 - distancia de Levenshtein / largo mayor, sobre las formas comparables."""
+    a, b = forma_comparable(a), forma_comparable(b)
+    if not a and not b:
+        return 1.0
+    previa = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        actual = [i]
+        for j, cb in enumerate(b, 1):
+            actual.append(min(previa[j] + 1, actual[j - 1] + 1, previa[j - 1] + (ca != cb)))
+        previa = actual
+    return 1 - previa[-1] / max(len(a), len(b))
+
+
+def preparar_glosario(glosario):
+    """Datos del glosario para el filtro: texto comparable y apodos.
+
+    Apodos = formas válidas de trato, escritas en el glosario entre paréntesis
+    con una aclaración después de ':' (ej. "Luciana Petrone (Luz, Lu: así la
+    nombran en clase)"). Los paréntesis sin ':' son variantes erróneas. Los
+    títulos de sección ("== CRONOGRAMA (fecha: tema: docente) ==") no cuentan.
+    """
+    apodos = set()
+    cuerpo = "\n".join(l for l in (glosario or "").splitlines() if not l.strip().startswith("=="))
+    for contenido in re.findall(r"\(([^()]*)\)", cuerpo):
+        if ":" in contenido:
+            for forma in re.split(r"[,/]", contenido.split(":", 1)[0]):
+                if forma.strip():
+                    apodos.add(forma_comparable(forma.strip()))
+    return {"texto": forma_comparable(glosario or ""), "apodos": apodos}
+
+
+def esta_en_glosario(termino, info):
+    patron = rf"(?<!\w){re.escape(forma_comparable(termino))}(?!\w)"
+    return bool(info["texto"]) and re.search(patron, info["texto"]) is not None
+
+
+def patron_palabra(frase):
+    return re.compile(rf"(?<!\w){re.escape(frase)}(?!\w)")
+
+
+def es_nombre_propio(original, corregido, bloque):
+    """True si la corrección es un nombre propio o sigla; None si no se puede saber.
+
+    Una mayúscula al principio de oración no alcanza para decir que es nombre
+    propio: en ese caso devuelve None y decide el glosario.
+    """
+    palabras = re.findall(r"[^\W\d_][\w'-]*", corregido)
+    if not palabras:
+        return False
+    if any(len(p) >= 2 and p.isupper() for p in palabras):
+        return True   # sigla
+    if any(p[0].isupper() for p in palabras[1:]):
+        return True
+    if not palabras[0][0].isupper():
+        return False
+    if not original[:1].isupper():
+        return True   # el modelo le puso mayúscula: lo trata como nombre
+    for m in patron_palabra(original).finditer(bloque):
+        antes = bloque[:m.start()].rstrip()
+        if antes and antes[-1] not in ".!?…¿¡:\"«":
+            return True   # aparece con mayúscula en medio de una oración
+    return None
+
+
+def filtrar_correccion(original, corregido, bloque, info):
+    """Devuelve None si la corrección se acepta, o el nombre de la regla que la descarta."""
+    def solo_letras(t):
+        return "".join(c for c in normalizar_guiones(t).casefold() if c.isalnum())
+
+    if solo_letras(original) == solo_letras(corregido):
+        return "solo formato o puntuación"
+    if sorted(re.findall(r"\d", original)) != sorted(re.findall(r"\d", corregido)) or \
+            (re.search(r"\d", original) and solo_letras(re.sub(r"\d", "", original)) == solo_letras(re.sub(r"\d", "", corregido))):
+        return "cambia números"
+    if len(corregido.split()) > len(original.split()):
+        return "agrega palabras"
+    if forma_comparable(original) in info["apodos"]:
+        return "apodo o forma de trato del glosario"
+    a, b = forma_comparable(original), forma_comparable(corregido)
+    if len(b) > len(a) and b.startswith(a):
+        return "completa una palabra cortada"
+    if not patron_palabra(original).search(bloque):
+        return "no aparece en el bloque"
+
+    propio = es_nombre_propio(original, corregido, bloque)
+    if propio:
+        return None if esta_en_glosario(corregido, info) else "nombre propio o sigla fuera del glosario"
+    if propio is None and esta_en_glosario(corregido, info):
+        return None
+    valor = similitud(original, corregido)
+    if valor < UMBRAL_SIMILITUD:
+        return f"similitud baja ({valor:.2f} < {UMBRAL_SIMILITUD})"
+    return None
+
+
+def aplicar_correcciones(bloque, pares):
+    """Aplica las correcciones aceptadas sobre el bloque ORIGINAL, en una sola pasada."""
+    if not pares:
+        return bloque
+    reemplazos = dict(pares)
+    patron = re.compile("|".join(
+        rf"(?<!\w){re.escape(a)}(?!\w)" for a in sorted(reemplazos, key=len, reverse=True)))
+    return patron.sub(lambda m: reemplazos[m.group(0)], bloque)
 
 
 def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
@@ -839,13 +975,14 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
 
     Devuelve (texto final, correcciones sin repetir, resumen dict).
     """
-    resumen = {"bloques": 0, "corregidos": 0, "descartados": 0, "sin_corregir": 0}
+    resumen = {"bloques": 0, "corregidos": 0, "descartados": 0, "sin_corregir": 0, "auditoria": []}
     if not groq_key or ESTADO["sin_cuota_correccion"]:
         motivo = "sin GROQ_API_KEY" if not groq_key else "cuota del corrector agotada en esta corrida"
         log(f"{etiqueta}: se guarda sin corregir ({motivo}).")
         return texto, [], dict(resumen, sin_corregir=1, motivo=motivo)
 
     tema = tema_de_clase(glosario, clase)
+    info = preparar_glosario(glosario)
     palabras = palabras_por_bloque(glosario)
     bloques = dividir_en_bloques(texto, palabras)
     resumen["bloques"] = len(bloques)
@@ -863,16 +1000,31 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
             resumen["sin_corregir"] += 1
             continue
         try:
-            corregido, pares = corregir_bloque(groq_key, bloque, glosario, tema,
-                                               {"clase": clase, "n": n, "total": len(bloques)})
-            salida.append(corregido + sep)
-            correcciones += pares
+            _, propuestas = corregir_bloque(groq_key, bloque, glosario, tema,
+                                            {"clase": clase, "n": n, "total": len(bloques)})
+            aceptadas = []
+            for original, corregido in propuestas:
+                corregido = normalizar_guiones(corregido)
+                if any(original == a for a, _ in aceptadas):
+                    regla = "repetida en el bloque"
+                else:
+                    regla = filtrar_correccion(original, corregido, bloque, info)
+                resumen["auditoria"].append({"bloque": n, "original": original, "correccion": corregido,
+                                             "estado": "aceptada" if regla is None else "descartada",
+                                             "regla": regla or ""})
+                if regla is None:
+                    aceptadas.append((original, corregido))
+            salida.append(aplicar_correcciones(bloque, aceptadas) + sep)
+            correcciones += aceptadas
             resumen["corregidos"] += 1
             fallas_seguidas = 0
-            log(f"{etiqueta}: bloque {n}/{len(bloques)} corregido ({len(pares)} corrección(es)).")
+            log(f"{etiqueta}: bloque {n}/{len(bloques)}: {len(aceptadas)} de {len(propuestas)} corrección(es) aceptada(s).")
         except BloqueDescartado as e:
             salida.append(bloque + sep)
             resumen["descartados"] += 1
+            for original, corregido in e.propuestas:
+                resumen["auditoria"].append({"bloque": n, "original": original, "correccion": corregido,
+                                             "estado": "descartada", "regla": f"bloque descartado: {e}"})
             log(f"{etiqueta}: bloque {n}/{len(bloques)} DESCARTADO ({e}); queda el original.")
         except SinCuotaCorreccion as e:
             ESTADO["sin_cuota_correccion"] = True
@@ -891,16 +1043,43 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
         resumen["motivo"] = cortar
 
     unicas = list(dict.fromkeys(correcciones))
+    auditoria = resumen["auditoria"]
+    resumen["propuestas"] = len(auditoria)
+    resumen["filtradas"] = sum(1 for f in auditoria if f["estado"] == "descartada")
     log(f"{etiqueta}: corrección lista: {resumen['corregidos']} bloque(s) corregido(s), "
         f"{resumen['descartados']} descartado(s), {resumen['sin_corregir']} sin corregir; "
-        f"{len(unicas)} corrección(es) distinta(s).")
+        f"{resumen['propuestas']} corrección(es) propuesta(s), {resumen['filtradas']} descartada(s) por el filtro, "
+        f"{len(unicas)} aplicada(s) distinta(s).")
     return "".join(salida), unicas, resumen
+
+
+def resumen_auditoria(auditoria):
+    """Líneas de resumen: aceptadas y descartadas por regla."""
+    reglas = {}
+    for f in auditoria:
+        if f["estado"] == "descartada":
+            clave = re.sub(r" \(.*\)$", "", f["regla"])
+            reglas[clave] = reglas.get(clave, 0) + 1
+    aceptadas = sum(1 for f in auditoria if f["estado"] == "aceptada")
+    lineas = [f"Auditoría: {len(auditoria)} propuesta(s), {aceptadas} aceptada(s), {len(auditoria) - aceptadas} descartada(s)."]
+    lineas += [f"  descartadas por '{r}': {c}" for r, c in sorted(reglas.items(), key=lambda x: -x[1])]
+    return lineas
+
+
+def auditoria_csv(auditoria):
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["bloque", "original", "correccion", "estado", "regla"], lineterminator="\n")
+    w.writeheader()
+    w.writerows(auditoria)
+    return buf.getvalue()
 
 
 def seccion_correcciones(correcciones, resumen):
     lineas = ["", "", SEPARADOR_CORRECCIONES, TITULO_CORRECCIONES,
               f"(automáticas con {MODELO_CORRECCION}; bloques: {resumen['bloques']}, corregidos: {resumen['corregidos']}, "
               f"descartados: {resumen['descartados']}, sin corregir: {resumen['sin_corregir']}"
+              + (f"; correcciones propuestas: {resumen['propuestas']}, descartadas por el filtro: {resumen['filtradas']}"
+                 if resumen.get("propuestas") else "")
               + (f" — {resumen['motivo']}" if resumen.get("motivo") else "") + ")"]
     lineas += [f"- {a} → {b}" for a, b in correcciones] or ["- ninguna"]
     return "\n".join(lineas)
@@ -989,6 +1168,8 @@ def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_part
             guardar_texto(drive, carpeta_partes, salida + SUFIJO_SIN_CORREGIR, texto)
         glosario = glosario_de(drive, carpeta_materia, materia)
         corregido, correcciones, resumen = corregir_transcripcion(claves.get("groq"), texto, glosario, base, etiqueta)
+        for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
+            log(f"{etiqueta}: {linea}")
         texto = corregido + seccion_correcciones(correcciones, resumen)
     guardar_texto(drive, carpeta_trans, salida, texto, como_doc=True)
     for n in nombres_partes:
@@ -1205,9 +1386,26 @@ def prueba_correccion(drive, claves, materias, materia_buscada, clase_buscada):
     guardar_texto(drive, m["trans"], salida, corregido + seccion_correcciones(correcciones, resumen), como_doc=True)
     log(f"{etiqueta}: MODO PRUEBA: guardado en {(time.time() - inicio) / 60:.1f} min. "
         f"Largo: {len(texto)} -> {len(corregido)} caracteres.")
-    log(f"{etiqueta}: correcciones aplicadas ({len(correcciones)}):")
-    for a, b in correcciones:
-        log(f"    {a} → {b}")
+    auditoria = resumen["auditoria"]
+    log(f"{etiqueta}: correcciones propuestas por el modelo ({len(auditoria)}):")
+    for f in auditoria:
+        estado = "OK        " if f["estado"] == "aceptada" else "DESCARTADA"
+        log(f"    [{estado}] bloque {f['bloque']}: {f['original']} → {f['correccion']}"
+            + (f"   ({f['regla']})" if f["regla"] else ""))
+
+    # Archivo de auditoría: local (artefacto del workflow) y en _partes
+    contenido = auditoria_csv(auditoria)
+    nombre_csv = f"{salida} - auditoría.csv"
+    os.makedirs(CARPETA_AUDITORIA, exist_ok=True)
+    Path(CARPETA_AUDITORIA, nombre_csv).write_text(contenido, encoding="utf-8")
+    try:
+        guardar_texto(drive, m["partes"], nombre_csv, contenido, mime="text/csv")
+        log(f"{etiqueta}: auditoría guardada en {NOMBRE_TRANSCRIPCIONES}/{NOMBRE_PARTES}/{nombre_csv} "
+            f"y como artefacto del workflow.")
+    except Exception as e:  # noqa: BLE001
+        log(f"{etiqueta}: no pude subir la auditoría a Drive ({e}); queda como artefacto del workflow.")
+    for linea in resumen_auditoria(auditoria):
+        log(f"{etiqueta}: {linea}")
 
 
 def main():

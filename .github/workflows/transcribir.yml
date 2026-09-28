@@ -56,3 +56,11 @@ jobs:
           PRUEBA_GROQ_AUDIO: ${{ inputs.prueba_groq_audio }}
           PRUEBA_CORRECCION_AUDIO: ${{ inputs.prueba_correccion_audio }}
         run: python transcribir.py
+
+      - name: Subir auditoría de la corrección (modo prueba)
+        if: always() && inputs.prueba_correccion_audio != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: auditoria-correccion
+          path: auditoria/
+          if-no-files-found: ignore
