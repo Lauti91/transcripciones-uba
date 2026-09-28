@@ -43,6 +43,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 NOMBRE_TRANSCRIPCIONES = "Transcripciones"
 NOMBRE_PARTES = "_partes"
+NOMBRE_RESUMENES = "Resúmenes de clase"   # dentro de cada materia (visible para Claude)
+SUFIJO_RESUMEN_SPARK = " - Resumen de clase"
 SUFIJO_RESUMEN = " - resumen"
 
 MODELO_TRANSCRIPCION = "gemini-3.5-transcribe"
@@ -572,12 +574,56 @@ def transcribir_pendientes(drive, api_key, m):
                 log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
 
 
+def copiar_resumenes_spark(drive, materias):
+    """Fase 0: copiar los resúmenes que Gemini Spark dejó en su carpeta privada.
+
+    Spark escribe en una carpeta SIN compartir (así no pide confirmación):
+      RESÚMENES SPARK/<materia>/"dd-mm - Resumen de clase"
+    Este paso los copia a CLASES/<materia>/Resúmenes de clase, que sí ve Claude.
+    Se activa definiendo CARPETA_RESUMENES_SPARK_ID (ID de "RESÚMENES SPARK").
+    """
+    origen_raiz = os.environ.get("CARPETA_RESUMENES_SPARK_ID")
+    if not origen_raiz:
+        return
+    subcarpetas_spark = {
+        i["name"]: i["id"] for i in listar(drive, origen_raiz)
+        if i["mimeType"] == "application/vnd.google-apps.folder"
+    }
+    for materia, carpeta_id in materias:
+        origen = subcarpetas_spark.get(materia)
+        if not origen:
+            continue
+        try:
+            resumenes = [
+                i for i in listar(drive, origen)
+                if i["mimeType"] == "application/vnd.google-apps.document" and i["name"].endswith(SUFIJO_RESUMEN_SPARK)
+            ]
+            if not resumenes:
+                continue
+            destino = subcarpeta(drive, carpeta_id, NOMBRE_RESUMENES)
+            ya_estan = archivos_por_nombre(drive, destino)
+            for r in resumenes:
+                if r["name"] in ya_estan:
+                    continue
+                drive.files().copy(
+                    fileId=r["id"],
+                    body={"name": r["name"], "parents": [destino]},
+                    supportsAllDrives=True,
+                ).execute(num_retries=REINTENTOS_DRIVE)
+                log(f"[{materia}] copiado a '{NOMBRE_RESUMENES}': {r['name']}")
+        except Exception as e:  # noqa: BLE001
+            log(f"[{materia}] ERROR copiando resúmenes de Spark: {e}")
+
+
 def main():
     api_key = env("GEMINI_API_KEY")
     drive = conectar_drive()
     materias = obtener_materias(drive, env("CARPETA_CLASES_ID"))
     log(f"Materias: {', '.join(m for m, _ in materias) or 'ninguna'}"
         f" | resúmenes en este script: {'sí' if HACER_RESUMENES else 'no (los hace Gemini Spark)'}")
+
+    # Fase 0: copiar resúmenes de Spark (rápido, no usa Gemini)
+    copiar_resumenes_spark(drive, materias)
 
     preparadas = []
     for nombre, carpeta_id in materias:
