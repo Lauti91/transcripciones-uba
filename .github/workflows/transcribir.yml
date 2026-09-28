@@ -5,20 +5,24 @@ on:
     - cron: "*/30 * * * *"   # cada 30 minutos (hora UTC)
   workflow_dispatch:           # botón "Run workflow" para correrlo a mano
     inputs:
-      prueba_groq_materia:
-        description: "MODO PRUEBA GROQ: materia (ej. DESARROLLO). Vacío = corrida normal."
+      prueba_materia:
+        description: "MODO PRUEBA: materia (ej. DESARROLLO). Vacío = corrida normal."
         required: false
         default: ""
       prueba_groq_audio:
-        description: "MODO PRUEBA GROQ: audio sin extensión (ej. 27-08). Se guarda como '<audio> (groq)'."
+        description: "PRUEBA GROQ: audio sin extensión (ej. 27-08). Se guarda como '<audio> (groq)'."
+        required: false
+        default: ""
+      prueba_correccion_audio:
+        description: "PRUEBA CORRECCIÓN: clase ya transcripta (ej. 24-09). Se guarda como '<clase> (corregida)'."
         required: false
         default: ""
 
 # Nunca dos corridas normales a la vez: si una sigue en curso, la nueva espera.
-# El modo prueba va en otro grupo, así una corrida programada no lo cancela
-# mientras espera (solo escribe "<audio> (groq)", no pisa nada de la normal).
+# Los modos prueba van en otro grupo, así una corrida programada no los cancela
+# mientras esperan (solo escriben "(groq)" / "(corregida)", no pisan nada).
 concurrency:
-  group: transcribir${{ inputs.prueba_groq_audio && '-prueba' || '' }}
+  group: transcribir${{ (inputs.prueba_groq_audio || inputs.prueba_correccion_audio) && '-prueba' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -48,6 +52,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           CARPETA_CLASES_ID: ${{ secrets.CARPETA_CLASES_ID }}
           CARPETA_RESUMENES_SPARK_ID: ${{ secrets.CARPETA_RESUMENES_SPARK_ID }}
-          PRUEBA_GROQ_MATERIA: ${{ inputs.prueba_groq_materia }}
+          PRUEBA_MATERIA: ${{ inputs.prueba_materia }}
           PRUEBA_GROQ_AUDIO: ${{ inputs.prueba_groq_audio }}
+          PRUEBA_CORRECCION_AUDIO: ${{ inputs.prueba_correccion_audio }}
         run: python transcribir.py
