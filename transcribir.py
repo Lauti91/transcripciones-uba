@@ -19,6 +19,10 @@ accesos directos). Para cada audio de clase:
 Transcripción y resumen se guardan como Google Docs en la subcarpeta
 "Transcripciones" de cada materia.
 
+Fase de pendientes (al final de cada corrida): las transcripciones que quedaron
+sin corregir (se acabó la cuota) se corrigen desde el original de _partes, de la
+fecha más vieja a la más nueva, y el Doc se reemplaza EN EL LUGAR (mismo archivo).
+
 Variables de entorno necesarias (en GitHub van como secretos):
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN,
   GEMINI_API_KEY, CARPETA_CLASES_ID
@@ -94,6 +98,22 @@ UMBRAL_SIMILITUD = float(os.environ.get("UMBRAL_SIMILITUD", "0.6"))
 UMBRAL_SIMILITUD_NOMBRES = float(os.environ.get("UMBRAL_SIMILITUD_NOMBRES", "0.4"))
 TABLA_GUIONES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-"})
 CARPETA_AUDITORIA = "auditoria"   # CSV local del modo prueba (el workflow lo sube como artefacto)
+# Glosario por bloque: en cada pedido se manda lo fijo (encabezado, docentes,
+# cronograma) y solo las entradas que aparecen o se parecen a algo del bloque.
+# Ahorra tokens del límite diario (un glosario de ~6.000 tokens se reenviaba
+# entero en cada bloque). El filtro de correcciones sigue usando el glosario
+# completo, así que lo que no se manda no se acepta por error.
+# (no "catedra": hay secciones de conceptos cuyo título menciona "la cátedra")
+SECCIONES_FIJAS_GLOSARIO = ("docente", "profesor", "cronograma", "calendario")
+UMBRAL_RELEVANCIA_GLOSARIO = float(os.environ.get("UMBRAL_RELEVANCIA_GLOSARIO", "0.55"))
+MAX_CARACTERES_GLOSARIO_VARIABLE = 4200    # ≈ 1.200 tokens de entradas por bloque, como máximo
+PALABRAS_VACIAS_GLOSARIO = {
+    "que", "los", "las", "del", "con", "por", "para", "una", "uno", "sus", "como", "este", "esta", "esto",
+    "the", "and", "for", "with", "sin", "sobre", "entre", "desde", "hasta", "cuando", "donde",
+}
+# Fase de pendientes: estimación de tiempo por bloque (incluye la espera por
+# tokens/min), para no empezar una clase que no alcanza a terminar en la corrida.
+MINUTOS_POR_BLOQUE_CORRECCION = 0.8
 SUFIJO_SIN_CORREGIR = " (sin corregir)"    # copia cruda, en _partes
 SUFIJO_PRUEBA_CORRECCION = " (corregida)"
 SEPARADOR_CORRECCIONES = "────────────────────"
@@ -207,6 +227,8 @@ TRANSCRIPCIÓN:
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 INICIO = time.time()
 GLOSARIOS = {}   # carpeta de materia -> texto del glosario (o None)
+MIME_DOC = "application/vnd.google-apps.document"
+CORREGIDOS_EN_ESTA_CORRIDA = set()   # (materia, nombre del Doc) ya corregidos completos: la fase de pendientes no los relee
 ESTADO = {"sin_cuota_gemini": False, "sin_cuota_groq": False, "sin_cuota_correccion": False}
 
 
@@ -309,7 +331,8 @@ def leer_texto(drive, item):
     terminado = False
     while not terminado:
         _, terminado = dl.next_chunk(num_retries=REINTENTOS_DRIVE)
-    return buf.getvalue().decode("utf-8-sig")
+    # Google exporta los Docs con \r\n: se normaliza para que el texto no dependa de eso.
+    return buf.getvalue().decode("utf-8-sig").replace("\r\n", "\n")
 
 
 def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False, mime="text/plain"):
@@ -741,10 +764,120 @@ def tema_de_clase(glosario, base):
     return None
 
 
+def palabras_del_glosario(texto):
+    """Palabras significativas (sin tildes, en minúscula, 3+ letras, sin vacías) de un texto."""
+    return [p for p in re.findall(r"[^\W_]+", forma_comparable(texto))
+            if len(p) >= 3 and p not in PALABRAS_VACIAS_GLOSARIO]
+
+
+def bigramas(palabra):
+    return {palabra[i:i + 2] for i in range(len(palabra) - 1)}
+
+
+def preparar_glosario_bloques(glosario):
+    """Parte el glosario en lo fijo y las entradas que se eligen bloque por bloque.
+
+    Fijo: lo que está antes del primer "== ... ==" (título, uso) y las secciones
+    de docentes y cronograma. Entradas: cada línea de las demás secciones
+    (autores, instituciones, conceptos...). Un glosario sin secciones "== ==" se
+    manda entero, como antes.
+    """
+    fijo, entradas, encabezado, es_fija = [], [], None, True
+    for linea in (glosario or "").splitlines():
+        if not linea.strip():
+            continue
+        if linea.strip().startswith("=="):
+            encabezado = linea.strip()
+            es_fija = any(k in forma_comparable(linea) for k in SECCIONES_FIJAS_GLOSARIO)
+            if es_fija:
+                fijo.append("\n" + linea.strip())
+            continue
+        if es_fija:
+            fijo.append(linea)
+        else:
+            palabras = list(dict.fromkeys(palabras_del_glosario(linea)))
+            entradas.append({"encabezado": encabezado, "linea": linea, "palabras": palabras})
+    frecuencia = {}   # en cuántas entradas aparece cada palabra (para dar más peso a las raras)
+    for e in entradas:
+        for palabra in e["palabras"]:
+            frecuencia[palabra] = frecuencia.get(palabra, 0) + 1
+    return {
+        "fijo": "\n".join(fijo).strip(),
+        "entradas": entradas,
+        "frecuencia": frecuencia,
+        "caracteres_entradas": sum(len(e["linea"]) + 1 for e in entradas),
+        "caracteres_totales": len(glosario or ""),
+    }
+
+
+def seleccionar_glosario(prep, bloque):
+    """Texto del glosario para un bloque: lo fijo + las entradas que aparecen o se parecen a algo del bloque."""
+    if not prep["entradas"]:
+        return prep["fijo"]
+    palabras_bloque = set(palabras_del_glosario(bloque))
+    # Plural: "RCTs" en el bloque también alcanza a "RCT" del glosario.
+    exactas = palabras_bloque | {p[:-1] for p in palabras_bloque if p.endswith("s") and len(p) > 3}
+    largas = {p: bigramas(p) for p in palabras_bloque if len(p) >= 4}
+
+    mejor_por_palabra = {}   # palabra del glosario -> mejor similitud con alguna palabra del bloque
+
+    def relevancia(t):
+        if t in exactas:
+            return 1.0
+        if t in mejor_por_palabra:
+            return mejor_por_palabra[t]
+        mejor = 0.0
+        if len(t) >= 5:      # las palabras cortas solo cuentan si aparecen tal cual
+            bt = bigramas(t)
+            for w, bw in largas.items():
+                if abs(len(w) - len(t)) > 0.4 * max(len(w), len(t)):
+                    continue
+                if 2 * len(bt & bw) / (len(bt) + len(bw)) < 0.3:
+                    continue
+                mejor = max(mejor, similitud_normalizada(t, w))
+        mejor_por_palabra[t] = mejor
+        return mejor
+
+    # Puntaje de una entrada: suma de (parecido x rareza) de sus palabras que coinciden. Una
+    # palabra que está en muchas entradas ("modelo", "autorregresivo") pesa poco; una que casi
+    # no se repite (un apellido, una variante) pesa mucho. Si el tope de caracteres no alcanza
+    # para todas, quedan las más específicas.
+    total = len(prep["entradas"])
+    puntuadas = []
+    for orden, e in enumerate(prep["entradas"]):
+        puntaje = sum(v * math.log(1 + total / prep["frecuencia"][t])
+                      for t, v in ((t, relevancia(t)) for t in e["palabras"]) if v >= UMBRAL_RELEVANCIA_GLOSARIO)
+        if puntaje > 0:
+            puntuadas.append((puntaje, -orden, orden, e))
+    puntuadas.sort(key=lambda x: x[:3], reverse=True)
+
+    elegidas, usados = [], 0
+    for _, _, orden, e in puntuadas:
+        if usados + len(e["linea"]) + 1 > MAX_CARACTERES_GLOSARIO_VARIABLE:
+            continue
+        elegidas.append((orden, e))
+        usados += len(e["linea"]) + 1
+    elegidas.sort(key=lambda x: x[0])
+
+    partes, ultimo = [prep["fijo"]], None
+    for _, e in elegidas:
+        if e["encabezado"] != ultimo:
+            partes.append("\n" + e["encabezado"])
+            ultimo = e["encabezado"]
+        partes.append(e["linea"])
+    return "\n".join(partes).strip()
+
+
 def palabras_por_bloque(glosario):
-    """Achica los bloques si el glosario es largo, para entrar holgado en el límite por minuto."""
+    """Achica los bloques si el glosario es largo, para entrar holgado en el límite por minuto.
+
+    Acepta el texto del glosario o su versión preparada (preparar_glosario_bloques).
+    Cuenta lo fijo más, como máximo, las entradas que se mandan por bloque.
+    """
+    prep = glosario if isinstance(glosario, dict) else preparar_glosario_bloques(glosario)
+    caracteres = len(prep["fijo"]) + min(prep["caracteres_entradas"], MAX_CARACTERES_GLOSARIO_VARIABLE)
     # prompt + glosario (~3,5 caracteres por token) + razonamiento del modelo
-    tokens_fijos = (len(PROMPT_CORRECCION) + len(glosario or "")) / 3.5 + 1000
+    tokens_fijos = (len(PROMPT_CORRECCION) + caracteres) / 3.5 + 1000
     disponible = LIMITE_TOKENS_MINUTO_CORRECCION * 0.85 - tokens_fijos
     # Entrada + salida (texto corregido + lista de correcciones) ≈ 2,1 veces el bloque.
     return max(200, min(PALABRAS_POR_BLOQUE, int(disponible / (TOKENS_POR_PALABRA * 2.1))))
@@ -791,9 +924,14 @@ def normalizar_correcciones(lista):
 
 
 def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
-    """Pide la corrección de un bloque. Devuelve (texto, [(original, corregido)])."""
+    """Pide la corrección de un bloque. Devuelve (texto, [(original, corregido)]).
+
+    'glosario' es el texto que se le muestra al modelo para este bloque
+    (ver seleccionar_glosario); None si la materia no tiene.
+    """
     usuario = (
-        f"GLOSARIO DE LA MATERIA:\n{glosario or '(no hay glosario para esta materia)'}\n\n"
+        f"GLOSARIO DE LA MATERIA{' (docentes, cronograma y solo las entradas relacionadas con este bloque)' if glosario else ''}:\n"
+        f"{glosario or '(no hay glosario para esta materia)'}\n\n"
         f"CLASE: {contexto['clase']} | TEMA SEGÚN CRONOGRAMA: {tema or 'no figura'}\n\n"
         f"BLOQUE {contexto['n']} DE {contexto['total']} A CORREGIR:\n<<<\n{bloque}\n>>>"
     )
@@ -870,7 +1008,11 @@ def forma_comparable(texto):
 
 def similitud(a, b):
     """1 - distancia de Levenshtein / largo mayor, sobre las formas comparables."""
-    a, b = forma_comparable(a), forma_comparable(b)
+    return similitud_normalizada(forma_comparable(a), forma_comparable(b))
+
+
+def similitud_normalizada(a, b):
+    """Igual que similitud() pero sobre textos que ya pasaron por forma_comparable."""
     if not a and not b:
         return 1.0
     previa = list(range(len(b) + 1))
@@ -1065,9 +1207,13 @@ def aplicar_correcciones(bloque, pares, ajustables=()):
 def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
     """Corrige la transcripción por bloques. Nunca falla: ante problemas usa el original.
 
-    Devuelve (texto final, correcciones sin repetir, resumen dict).
+    Devuelve (texto final, correcciones sin repetir, resumen dict). En
+    resumen["completa"] va True solo si se procesaron TODOS los bloques (los
+    descartados por el modelo cuentan como procesados): quien reemplaza un Doc
+    tiene que usar el resultado solo si la corrección quedó completa.
     """
-    resumen = {"bloques": 0, "corregidos": 0, "descartados": 0, "sin_corregir": 0, "auditoria": []}
+    resumen = {"bloques": 0, "corregidos": 0, "descartados": 0, "sin_corregir": 0, "auditoria": [],
+               "completa": False}
     if not groq_key or ESTADO["sin_cuota_correccion"]:
         motivo = "sin GROQ_API_KEY" if not groq_key else "cuota del corrector agotada en esta corrida"
         log(f"{etiqueta}: se guarda sin corregir ({motivo}).")
@@ -1075,11 +1221,17 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
 
     tema = tema_de_clase(glosario, clase)
     info = preparar_glosario(glosario)
-    palabras = palabras_por_bloque(glosario)
+    prep = preparar_glosario_bloques(glosario)
+    palabras = palabras_por_bloque(prep)
     bloques = dividir_en_bloques(texto, palabras)
     resumen["bloques"] = len(bloques)
     log(f"{etiqueta}: corrigiendo {len(bloques)} bloque(s) de ~{palabras} palabras con {MODELO_CORRECCION} "
         f"({'con' if glosario else 'sin'} glosario; tema: {tema or 'no figura'}).")
+    if glosario:
+        log(f"{etiqueta}: glosario completo ≈ {prep['caracteres_totales'] / 3.5:.0f} tokens; por bloque se manda lo fijo "
+            f"(≈ {len(prep['fijo']) / 3.5:.0f}) más las entradas relacionadas "
+            f"({len(prep['entradas'])} entradas en total).")
+    enviados = []   # caracteres de glosario mandados en cada bloque
 
     salida, correcciones, fallas_seguidas, cortar = [], [], 0, None
     for n, (bloque, sep) in enumerate(bloques, 1):
@@ -1092,7 +1244,9 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
             resumen["sin_corregir"] += 1
             continue
         try:
-            _, propuestas = corregir_bloque(groq_key, bloque, glosario, tema,
+            glosario_bloque = seleccionar_glosario(prep, bloque) if glosario else None
+            enviados.append(len(glosario_bloque or ""))
+            _, propuestas = corregir_bloque(groq_key, bloque, glosario_bloque, tema,
                                             {"clase": clase, "n": n, "total": len(bloques)})
             aceptadas, ajustables = [], set()
             for original, corregido in propuestas:
@@ -1138,9 +1292,13 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
         log(f"{etiqueta}: corrección cortada ({cortar}); lo que faltaba queda sin corregir.")
         resumen["motivo"] = cortar
 
+    resumen["completa"] = resumen["sin_corregir"] == 0 and not cortar
     unicas = list(dict.fromkeys(correcciones))
     auditoria = resumen["auditoria"]
     resumen["propuestas"] = len(auditoria)
+    if enviados:
+        log(f"{etiqueta}: glosario mandado por bloque: ≈ {sum(enviados) / len(enviados) / 3.5:.0f} tokens en promedio "
+            f"(máximo ≈ {max(enviados) / 3.5:.0f}; completo ≈ {prep['caracteres_totales'] / 3.5:.0f}).")
     resumen["filtradas"] = sum(1 for f in auditoria if f["estado"] == "descartada")
     log(f"{etiqueta}: corrección lista: {resumen['corregidos']} bloque(s) corregido(s), "
         f"{resumen['descartados']} descartado(s), {resumen['sin_corregir']} sin corregir; "
@@ -1181,10 +1339,29 @@ def seccion_correcciones(correcciones, resumen):
     return "\n".join(lineas)
 
 
+# La marca es el título seguido de la línea "(automáticas con ...". La línea de separador de
+# arriba es opcional y puede ser cualquier fila de símbolos: no se depende de que Docs la conserve.
+# Tolera saltos de línea de más (Docs podría exportar líneas en blanco entre párrafos).
+PATRON_SECCION = re.compile(rf"(?:\s*[^\w\s]{{3,}})?\s*{re.escape(TITULO_CORRECCIONES)}\s+\(autom")
+
+
 def quitar_seccion_correcciones(texto):
     """Saca la sección 'Correcciones aplicadas' de un Doc ya corregido (para re-corregir)."""
-    i = texto.find("\n" + SEPARADOR_CORRECCIONES + "\n" + TITULO_CORRECCIONES)
-    return texto[:i].rstrip() if i >= 0 else texto
+    m = PATRON_SECCION.search(texto)
+    return texto[:m.start()].rstrip() if m else texto
+
+
+def estado_correccion(texto):
+    """'sin' (no tiene la sección), 'parcial' (la tiene pero quedaron bloques sin corregir) o 'completa'.
+
+    La sección "Correcciones aplicadas" es la marca. En los Docs viejos que se
+    guardaron cuando se acabó la cuota dice "sin corregir: N" con N > 0.
+    """
+    m = PATRON_SECCION.search(texto)
+    if not m:
+        return "sin"
+    faltan = re.search(r"sin corregir: (\d+)", texto[m.end():m.end() + 800])
+    return "parcial" if faltan and int(faltan.group(1)) > 0 else "completa"
 
 
 def normalizar(nombre):
@@ -1266,7 +1443,14 @@ def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_part
         corregido, correcciones, resumen = corregir_transcripcion(claves.get("groq"), texto, glosario, base, etiqueta)
         for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
             log(f"{etiqueta}: {linea}")
-        texto = corregido + seccion_correcciones(correcciones, resumen)
+        if resumen["completa"]:
+            texto = corregido + seccion_correcciones(correcciones, resumen)
+            CORREGIDOS_EN_ESTA_CORRIDA.add((materia, salida))
+        else:
+            # Nunca un Doc a medias: sin corregir y sin sección. La fase de pendientes
+            # lo corrige entero, desde el original de _partes, cuando haya cuota.
+            log(f"{etiqueta}: la corrección quedó incompleta ({resumen.get('motivo', 'ver arriba')}); "
+                f"el Doc se guarda sin corregir y queda para la fase de pendientes.")
     guardar_texto(drive, carpeta_trans, salida, texto, como_doc=True)
     for n in nombres_partes:
         a_papelera(drive, partes[n]["id"])
@@ -1368,6 +1552,154 @@ def transcribir_pendientes(drive, claves, m):
                 resumir(drive, claves["gemini"], m["materia"], base, nuevos[base], m["trans"])
             except Exception as e:  # noqa: BLE001
                 log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
+
+
+def clave_fecha(nombre):
+    """(mes, día) de un nombre 'dd-mm ...' para ordenar de la más vieja a la más nueva."""
+    m = re.match(r"\s*(\d{1,2})[-/.](\d{1,2})", nombre or "")
+    return (int(m.group(2)), int(m.group(1))) if m else (99, 99)
+
+
+def minutos_restantes():
+    return MAX_MINUTOS_CORRIDA - (time.time() - INICIO) / 60
+
+
+def textos_equivalentes(esperado, leido):
+    """True si lo leído de Drive es lo escrito (ignora saltos de línea y espacios que Docs normaliza)."""
+    a, b = " ".join(esperado.split()), " ".join(leido.split())
+    if a == b:
+        return True
+    return bool(a) and abs(len(a) - len(b)) <= 0.01 * len(a) and a[:300] == b[:300] and a[-300:] == b[-300:]
+
+
+def reemplazar_doc(drive, doc, nuevo, previo, etiqueta):
+    """Reemplaza el contenido de un Google Doc EN EL LUGAR: mismo archivo, mismo ID, mismo nombre.
+
+    No lo borra ni lo recrea (se rompería el vínculo con el resumen de Spark y con
+    la carpeta). Después de escribir lo vuelve a leer; si no coincide con lo
+    escrito, restaura el contenido anterior y falla.
+    """
+    def escribir(texto):
+        media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype="text/plain", resumable=True)
+        r = drive.files().update(
+            fileId=doc["id"], media_body=media, fields="id, name, mimeType", supportsAllDrives=True,
+        ).execute(num_retries=REINTENTOS_DRIVE)
+        if r.get("id") != doc["id"] or r.get("name") != doc["name"] or r.get("mimeType") != MIME_DOC:
+            raise RuntimeError(f"Drive devolvió otro archivo al actualizar: {r}")
+
+    escribir(nuevo)
+    try:
+        leido = leer_texto(drive, {"id": doc["id"], "mimeType": MIME_DOC})
+        coincide = textos_equivalentes(nuevo, leido)
+    except Exception as e:  # noqa: BLE001
+        coincide, leido = False, f"(no se pudo leer: {e})"
+    if coincide:
+        return
+    log(f"{etiqueta}: lo que quedó en el Doc no coincide con lo escrito; restauro el contenido anterior.")
+    escribir(previo)
+    raise RuntimeError("el Doc no quedó como se escribió; se restauró el contenido anterior")
+
+
+def corregir_pendientes(drive, claves, preparadas):
+    """Fase 3: corregir los Docs que quedaron sin corregir, reemplazándolos en el lugar.
+
+    - Van de la fecha más vieja a la más nueva. Las clases nuevas de esta corrida ya
+      tuvieron prioridad: se corrigieron en la fase 2, antes de llegar acá.
+    - Un Doc está pendiente si no tiene la sección "Correcciones aplicadas" o si la
+      tiene con bloques sin corregir (los que se cortaron por cuota).
+    - Se corrige SIEMPRE desde el original de _partes ("<clase> (sin corregir)". Si
+      un Doc sin sección no tiene original, se guarda antes una copia de su texto).
+      Un Doc parcial sin original no se toca.
+    - Todo o nada: si la cuota se acaba a mitad de una clase, ese Doc queda como estaba
+      y la fase termina. Solo se reemplaza un Doc completo, no vacío, con largo entre
+      85 % y 115 % del original, y después de escribirlo se verifica lo guardado.
+    - Con MAX_PENDIENTES=N se corrigen a lo sumo N clases (sirve para probar con 1).
+    """
+    if not claves.get("groq"):
+        return
+    limite = int(os.environ.get("MAX_PENDIENTES") or 0) or None
+
+    candidatos = []
+    for m in preparadas:
+        try:
+            existentes = archivos_por_nombre(drive, m["trans"])
+        except Exception as e:  # noqa: BLE001
+            log(f"[{m['materia']}] no pude listar las transcripciones: {e}")
+            continue
+        for audio in m["audios"]:
+            base = nombre_base(audio["name"])
+            doc = existentes.get(base)
+            if doc and doc["mimeType"] == MIME_DOC and (m["materia"], base) not in CORREGIDOS_EN_ESTA_CORRIDA:
+                candidatos.append((clave_fecha(base), m["materia"], base, m, doc))
+    candidatos.sort(key=lambda c: c[:3])
+    if candidatos:
+        log(f"Pendientes: reviso {len(candidatos)} Doc(s) de la fecha más vieja a la más nueva"
+            f"{f' (máximo {limite} clase(s) a corregir)' if limite else ''}.")
+
+    hechos = fallos = 0
+    for _, materia, base, m, doc in candidatos:
+        if ESTADO["sin_cuota_correccion"] or tiempo_agotado():
+            break
+        if limite and hechos >= limite:
+            log(f"Pendientes: llegué al límite de {limite} clase(s) de esta corrida.")
+            break
+        etiqueta = f"[{materia}] {base}"
+        try:
+            actual = leer_texto(drive, doc).strip()
+            estado = estado_correccion(actual)
+            if estado == "completa":
+                continue
+
+            partes = archivos_por_nombre(drive, m["partes"])
+            nombre_crudo = base + SUFIJO_SIN_CORREGIR
+            if nombre_crudo in partes:
+                original = leer_texto(drive, partes[nombre_crudo]).strip()
+                if estado == "sin" and not textos_equivalentes(original, actual):
+                    log(f"{etiqueta}: el Doc difiere del original de {NOMBRE_PARTES} (¿editado a mano?); no lo toco.")
+                    continue
+            elif estado == "sin":
+                original = actual
+                guardar_texto(drive, m["partes"], nombre_crudo, original)
+                log(f"{etiqueta}: no había original en {NOMBRE_PARTES}; guardé una copia del Doc como '{nombre_crudo}'.")
+            else:
+                log(f"{etiqueta}: tiene correcciones parciales y no hay '{nombre_crudo}' en {NOMBRE_PARTES}; no lo toco.")
+                continue
+            if not original:
+                log(f"{etiqueta}: el original está vacío; no lo toco.")
+                continue
+
+            glosario = glosario_de(drive, m["carpeta"], materia)
+            bloques = math.ceil(len(original.split()) / palabras_por_bloque(glosario))
+            if bloques * MINUTOS_POR_BLOQUE_CORRECCION > minutos_restantes():
+                log(f"{etiqueta}: hacen falta ~{bloques * MINUTOS_POR_BLOQUE_CORRECCION:.0f} min y quedan "
+                    f"{max(0, minutos_restantes()):.0f} en esta corrida; sigue en la próxima.")
+                break
+
+            log(f"{etiqueta}: corrección pendiente ({'sin corregir' if estado == 'sin' else 'corrección parcial'}); "
+                f"la rehago entera desde el original.")
+            corregido, correcciones, resumen = corregir_transcripcion(claves["groq"], original, glosario, base, etiqueta)
+            for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
+                log(f"{etiqueta}: {linea}")
+            if not resumen["completa"]:
+                log(f"{etiqueta}: no se pudo terminar ({resumen.get('motivo', 'ver arriba')}); el Doc queda como estaba. "
+                    f"Sigue en la próxima corrida.")
+                break
+            if not corregido.strip() or not MIN_PROPORCION_CORRECCION <= len(corregido) / len(original) <= MAX_PROPORCION_CORRECCION:
+                log(f"{etiqueta}: ERROR: el texto corregido mide {len(corregido)} caracteres contra {len(original)} "
+                    f"del original; no reemplazo el Doc.")
+                continue
+            reemplazar_doc(drive, doc, corregido + seccion_correcciones(correcciones, resumen), actual, etiqueta)
+            CORREGIDOS_EN_ESTA_CORRIDA.add((materia, base))
+            hechos += 1
+            fallos = 0
+            log(f"{etiqueta}: Doc corregido y reemplazado en el lugar (mismo archivo).")
+        except Exception as e:  # noqa: BLE001 - la fase de pendientes nunca frena la corrida
+            fallos += 1
+            log(f"{etiqueta}: ERROR al corregir el pendiente: {e}")
+            if fallos >= 2:
+                log("Pendientes: dos errores seguidos; dejo el resto para la próxima corrida.")
+                break
+    log(f"Pendientes: {hechos} clase(s) corregida(s) en esta corrida.")
 
 
 def copiar_resumenes_spark(drive, materias):
@@ -1556,6 +1888,13 @@ def main():
             transcribir_pendientes(drive, claves, m)
         except Exception as e:  # noqa: BLE001
             log(f"[{m['materia']}] ERROR inesperado en transcripciones: {e}")
+
+    # Fase 3: corregir lo que quedó sin corregir (después de las clases nuevas, que tienen prioridad)
+    if claves["groq"] and not tiempo_agotado():
+        try:
+            corregir_pendientes(drive, claves, preparadas)
+        except Exception as e:  # noqa: BLE001
+            log(f"ERROR inesperado en la fase de pendientes: {e}")
 
     log("Fin de la corrida.")
 
