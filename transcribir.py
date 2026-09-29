@@ -35,6 +35,7 @@ Opcionales:
 """
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -112,10 +113,8 @@ PALABRAS_VACIAS_GLOSARIO = {
     "que", "los", "las", "del", "con", "por", "para", "una", "uno", "sus", "como", "este", "esta", "esto",
     "the", "and", "for", "with", "sin", "sobre", "entre", "desde", "hasta", "cuando", "donde",
 }
-# Fase de pendientes: estimación de tiempo por bloque (incluye la espera por
-# tokens/min), para no empezar una clase que no alcanza a terminar en la corrida.
-MINUTOS_POR_BLOQUE_CORRECCION = 0.8
 SUFIJO_SIN_CORREGIR = " (sin corregir)"    # copia cruda, en _partes
+SUFIJO_EN_CURSO = " (corrección en curso)"  # progreso de la corrección de una clase, en _partes
 SUFIJO_PRUEBA_CORRECCION = " (corregida)"
 SEPARADOR_CORRECCIONES = "────────────────────"
 TITULO_CORRECCIONES = "Correcciones aplicadas"
@@ -341,12 +340,13 @@ def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False, mime="text/p
     """Guarda un texto en Drive; con como_doc=True lo convierte en Google Doc."""
     media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype=mime, resumable=True)
     tipo = "application/vnd.google-apps.document" if como_doc else mime
-    drive.files().create(
+    creado = drive.files().create(
         body={"name": nombre, "parents": [carpeta_id], "mimeType": tipo},
         media_body=media,
         fields="id",
         supportsAllDrives=True,
     ).execute(num_retries=REINTENTOS_DRIVE)
+    return creado.get("id")
 
 
 def a_papelera(drive, archivo_id):
@@ -1237,8 +1237,59 @@ def aplicar_correcciones(bloque, pares, ajustables=()):
     return patron.sub(reemplazar, bloque)
 
 
-def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
+class PuntoControl:
+    """Progreso de la corrección de una clase, guardado en _partes para retomarlo en la próxima corrida.
+
+    Por qué existe: el tope diario de Groq es un balde que se rellena de a poco (200.000 tokens por
+    día = 2,3 por segundo), y una clase cuesta ~60.000. Entre corridas se recuperan ~30.000, así que
+    sin esto cada corrida gastaría lo que hay, fallaría a mitad y perdería el trabajo: no terminaría
+    nunca ninguna clase. Se guarda, por bloque, lo ya corregido; el Doc NO se toca hasta que la clase
+    está completa (sigue siendo todo o nada para el Doc). Solo vale si el original y el tamaño de
+    bloque son los mismos (SHA-1 del original); si no, se descarta y se empieza de nuevo.
+    """
+
+    def __init__(self, drive, carpeta_partes, base, original):
+        self.drive, self.carpeta = drive, carpeta_partes
+        self.nombre = base + SUFIJO_EN_CURSO
+        self.sha1 = hashlib.sha1(original.encode("utf-8")).hexdigest()
+        self.datos = {"v": 1, "sha1": self.sha1, "palabras": None, "bloques": {}}
+        self.id = None
+
+    def cargar(self, etiqueta=""):
+        existente = next((i for i in listar(self.drive, self.carpeta) if i["name"] == self.nombre), None)
+        if not existente:
+            return
+        self.id = existente["id"]
+        try:
+            datos = json.loads(leer_texto(self.drive, existente))
+        except ValueError:
+            datos = None
+        if isinstance(datos, dict) and datos.get("v") == 1 and datos.get("sha1") == self.sha1 and isinstance(datos.get("bloques"), dict):
+            self.datos = datos
+            log(f"{etiqueta}: retomo la corrección en curso: {len(datos['bloques'])} bloque(s) ya hechos en corridas anteriores.")
+        else:
+            log(f"{etiqueta}: había un punto de control de otra versión del texto; empiezo de nuevo.")
+
+    def guardar(self):
+        texto = json.dumps(self.datos, ensure_ascii=False)
+        if self.id:
+            media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype="text/plain", resumable=True)
+            self.drive.files().update(fileId=self.id, media_body=media, fields="id", supportsAllDrives=True).execute(
+                num_retries=REINTENTOS_DRIVE)
+        else:
+            self.id = guardar_texto(self.drive, self.carpeta, self.nombre, texto)
+
+    def borrar(self):
+        if self.id:
+            a_papelera(self.drive, self.id)
+            self.id = None
+
+
+def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta, punto=None):
     """Corrige la transcripción por bloques. Nunca falla: ante problemas usa el original.
+
+    Con 'punto' (PuntoControl) retoma los bloques ya hechos en corridas anteriores y guarda el
+    progreso después de cada bloque.
 
     Devuelve (texto final, correcciones sin repetir, resumen dict). En
     resumen["completa"] va True solo si se procesaron TODOS los bloques (los
@@ -1256,8 +1307,12 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
     info = preparar_glosario(glosario)
     prep = preparar_glosario_bloques(glosario)
     palabras = palabras_por_bloque(prep)
+    if punto is not None:
+        palabras = punto.datos.get("palabras") or palabras   # el mismo corte de bloques que la corrida anterior
+        punto.datos["palabras"] = palabras
     bloques = dividir_en_bloques(texto, palabras)
     resumen["bloques"] = len(bloques)
+    hechos = punto.datos["bloques"] if punto is not None else {}
     log(f"{etiqueta}: corrigiendo {len(bloques)} bloque(s) de ~{palabras} palabras con {MODELO_CORRECCION} "
         f"({'con' if glosario else 'sin'} glosario; tema: {tema or 'no figura'}).")
     if glosario:
@@ -1269,6 +1324,16 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
 
     salida, correcciones, fallas_seguidas, cortar = [], [], 0, None
     for n, (bloque, sep) in enumerate(bloques, 1):
+        previo = hechos.get(str(n))
+        if previo is not None:
+            # Bloque hecho en una corrida anterior: se reaplica lo que se aceptó, sin gastar tokens.
+            aceptadas = [tuple(par) for par in previo["aceptadas"]]
+            salida.append(aplicar_correcciones(bloque, aceptadas, set(previo["ajustables"])) + sep)
+            correcciones += aceptadas
+            resumen["auditoria"] += previo["auditoria"]
+            resumen["descartados" if previo["estado"] == "descartado" else "corregidos"] += 1
+            log(f"{etiqueta}: bloque {n}/{len(bloques)}: ya estaba hecho en una corrida anterior.")
+            continue
         if cortar is None and ESTADO["sin_cuota_correccion"]:
             cortar = "cuota del corrector agotada"
         if cortar is None and tiempo_agotado():
@@ -1277,6 +1342,7 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
             salida.append(bloque + sep)
             resumen["sin_corregir"] += 1
             continue
+        filas_antes = len(resumen["auditoria"])
         try:
             glosario_bloque = seleccionar_glosario(prep, bloque) if glosario else None
             enviados.append(len(glosario_bloque or ""))
@@ -1303,6 +1369,7 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
             resumen["corregidos"] += 1
             fallas_seguidas = 0
             log(f"{etiqueta}: bloque {n}/{len(bloques)}: {len(aceptadas)} de {len(propuestas)} corrección(es) aceptada(s).")
+            guardar_bloque(punto, hechos, n, "corregido", aceptadas, ajustables, resumen["auditoria"][filas_antes:], etiqueta)
         except BloqueDescartado as e:
             salida.append(bloque + sep)
             resumen["descartados"] += 1
@@ -1310,6 +1377,7 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
                 resumen["auditoria"].append({"bloque": n, "original": original, "correccion": corregido,
                                              "estado": "descartada", "regla": f"bloque descartado: {e}"})
             log(f"{etiqueta}: bloque {n}/{len(bloques)} DESCARTADO ({e}); queda el original.")
+            guardar_bloque(punto, hechos, n, "descartado", [], set(), resumen["auditoria"][filas_antes:], etiqueta)
         except SinCuotaCorreccion as e:
             ESTADO["sin_cuota_correccion"] = True
             salida.append(bloque + sep)
@@ -1345,6 +1413,18 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
         f"{resumen['propuestas']} corrección(es) propuesta(s), {resumen['filtradas']} descartada(s) por el filtro, "
         f"{len(unicas)} aplicada(s) distinta(s).")
     return "".join(salida), unicas, resumen
+
+
+def guardar_bloque(punto, hechos, n, estado, aceptadas, ajustables, filas, etiqueta):
+    """Anota en el punto de control un bloque terminado y lo sube a Drive (un fallo acá no frena la corrección)."""
+    if punto is None:
+        return
+    hechos[str(n)] = {"estado": estado, "aceptadas": [list(par) for par in aceptadas],
+                      "ajustables": sorted(ajustables), "auditoria": filas}
+    try:
+        punto.guardar()
+    except Exception as e:  # noqa: BLE001
+        log(f"{etiqueta}: no pude guardar el punto de control ({e}); el progreso de este bloque se pierde si se corta.")
 
 
 def resumen_auditoria(auditoria):
@@ -1480,7 +1560,9 @@ def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_part
         if salida + SUFIJO_SIN_CORREGIR not in partes:
             guardar_texto(drive, carpeta_partes, salida + SUFIJO_SIN_CORREGIR, texto)
         glosario = glosario_de(drive, carpeta_materia, materia)
-        corregido, correcciones, resumen = corregir_transcripcion(claves.get("groq"), texto, glosario, base, etiqueta)
+        punto = PuntoControl(drive, carpeta_partes, salida, texto)
+        punto.cargar(etiqueta)
+        corregido, correcciones, resumen = corregir_transcripcion(claves.get("groq"), texto, glosario, base, etiqueta, punto)
         for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
             log(f"{etiqueta}: {linea}")
         if resumen["completa"]:
@@ -1490,8 +1572,11 @@ def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_part
             # Nunca un Doc a medias: sin corregir y sin sección. La fase de pendientes
             # lo corrige entero, desde el original de _partes, cuando haya cuota.
             log(f"{etiqueta}: la corrección quedó incompleta ({resumen.get('motivo', 'ver arriba')}); "
-                f"el Doc se guarda sin corregir y queda para la fase de pendientes.")
+                f"el Doc se guarda sin corregir y la fase de pendientes sigue desde el punto de control "
+                f"({len(punto.datos['bloques'])} de {resumen['bloques']} bloques hechos).")
     guardar_texto(drive, carpeta_trans, salida, texto, como_doc=True)
+    if carpeta_materia and resumen["completa"]:
+        punto.borrar()
     for n in nombres_partes:
         a_papelera(drive, partes[n]["id"])
     log(f"{etiqueta}: transcripción completa guardada.")
@@ -1600,10 +1685,6 @@ def clave_fecha(nombre):
     return (int(m.group(2)), int(m.group(1))) if m else (99, 99)
 
 
-def minutos_restantes():
-    return MAX_MINUTOS_CORRIDA - (time.time() - INICIO) / 60
-
-
 def textos_equivalentes(esperado, leido):
     """True si lo leído de Drive es lo escrito (ignora saltos de línea y espacios que Docs normaliza)."""
     a, b = " ".join(esperado.split()), " ".join(leido.split())
@@ -1674,45 +1755,49 @@ def informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido,
             f"{len(leido)} ({len(leido) / len(original):.1%} del original, incluye la sección de correcciones).")
         log(f"{etiqueta}: VERIFICACIÓN 4 (marca): sección '{TITULO_CORRECCIONES}' "
             f"{'presente' if estado_correccion(leido) != 'sin' else 'AUSENTE'}; estado según el Doc: {estado_correccion(leido)}.")
-        n_partes = len(listar(drive, m["partes"]))
+        n_partes = contar_archivos(drive, m["partes"])
         log(f"{etiqueta}: VERIFICACIÓN 5 (duplicados): Docs llamados {doc['name']!r} en {NOMBRE_TRANSCRIPCIONES}: {len(mismos)}; "
-            f"archivos en {NOMBRE_TRANSCRIPCIONES}: antes {antes[0]}, después {len(en_trans)}; "
+            f"archivos en {NOMBRE_TRANSCRIPCIONES}: antes {antes[0]}, después {contar_archivos(drive, m['trans'])}; "
             f"archivos en {NOMBRE_PARTES}: antes {antes[1]}, después {n_partes}.")
     except Exception as e:  # noqa: BLE001
         log(f"{etiqueta}: no pude armar la verificación: {e}")
 
 
+def contar_archivos(drive, carpeta):
+    """Archivos de una carpeta, sin contar los puntos de control (van y vienen)."""
+    return len([i for i in listar(drive, carpeta) if not i["name"].endswith(SUFIJO_EN_CURSO)])
+
+
 def corregir_y_reemplazar(drive, claves, m, materia, base, doc, actual, original, nombre_crudo, descripcion):
     """Corrige 'original' (el de _partes) y reemplaza el Doc en el lugar. Devuelve (resultado, resumen).
 
-    resultado: "ok" | "sin_tiempo" (no alcanza el tiempo de la corrida) | "incompleta" (cuota, tiempo o
-    corrector: el Doc queda como estaba) | "guarda" (el largo no cierra: no se reemplaza).
+    resultado: "ok" | "incompleta" (cuota, tiempo o corrector: el Doc queda como estaba y el progreso queda
+    en el punto de control) | "guarda" (el largo no cierra: no se reemplaza).
     Los errores de Drive (incluida la restauración tras una verificación fallida) se propagan.
     """
     etiqueta = f"[{materia}] {base}"
     glosario = glosario_de(drive, m["carpeta"], materia)
-    bloques = math.ceil(len(original.split()) / palabras_por_bloque(glosario))
-    if bloques * MINUTOS_POR_BLOQUE_CORRECCION > minutos_restantes():
-        log(f"{etiqueta}: hacen falta ~{bloques * MINUTOS_POR_BLOQUE_CORRECCION:.0f} min y quedan "
-            f"{max(0, minutos_restantes()):.0f} en esta corrida; sigue en la próxima.")
-        return "sin_tiempo", None
-
-    log(f"{etiqueta}: corrección pendiente ({descripcion}); la rehago entera desde el original.")
-    corregido, correcciones, resumen = corregir_transcripcion(claves["groq"], original, glosario, base, etiqueta)
+    punto = PuntoControl(drive, m["partes"], base, original)
+    punto.cargar(etiqueta)
+    log(f"{etiqueta}: corrección pendiente ({descripcion}); "
+        f"{'sigo desde el punto de control' if punto.datos['bloques'] else 'la hago entera desde el original'}.")
+    corregido, correcciones, resumen = corregir_transcripcion(claves["groq"], original, glosario, base, etiqueta, punto)
     for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
         log(f"{etiqueta}: {linea}")
     listar_auditoria_en_log(etiqueta, resumen["auditoria"])
     if not resumen["completa"]:
-        log(f"{etiqueta}: no se pudo terminar ({resumen.get('motivo', 'ver arriba')}); el Doc queda como estaba. "
-            f"Sigue en la próxima corrida.")
+        log(f"{etiqueta}: no se pudo terminar ({resumen.get('motivo', 'ver arriba')}); el Doc queda como estaba y el "
+            f"progreso ({len(punto.datos['bloques'])} de {resumen['bloques']} bloques) queda guardado para la próxima corrida.")
         return "incompleta", resumen
     if not corregido.strip() or not MIN_PROPORCION_CORRECCION <= len(corregido) / len(original) <= MAX_PROPORCION_CORRECCION:
         log(f"{etiqueta}: ERROR: el texto corregido mide {len(corregido)} caracteres contra {len(original)} "
             f"del original; no reemplazo el Doc.")
+        punto.borrar()   # no repetir el mismo resultado en cada corrida
         return "guarda", resumen
-    antes = (len(listar(drive, m["trans"])), len(listar(drive, m["partes"])))
+    antes = (contar_archivos(drive, m["trans"]), contar_archivos(drive, m["partes"]))
     reemplazar_doc(drive, doc, corregido + seccion_correcciones(correcciones, resumen), actual, etiqueta)
     CORREGIDOS_EN_ESTA_CORRIDA.add((materia, base))
+    punto.borrar()
     informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido, antes, etiqueta)
     log(f"{etiqueta}: Doc corregido y reemplazado en el lugar (mismo archivo).")
     return "ok", resumen
@@ -1788,7 +1873,7 @@ def corregir_pendientes(drive, claves, preparadas):
 
             resultado, _ = corregir_y_reemplazar(drive, claves, m, materia, base, doc, actual, original, nombre_crudo,
                                                  "sin corregir" if estado == "sin" else "corrección parcial")
-            if resultado in ("sin_tiempo", "incompleta"):
+            if resultado == "incompleta":
                 break
             if resultado == "guarda":
                 continue
