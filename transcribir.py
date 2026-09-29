@@ -88,6 +88,10 @@ MAX_PROPORCION_CORRECCION = 1.15
 # corrección. Con 0,6 caen "bota → aborto" (0,50) y "dotes → dotaciones"
 # (0,50) y pasa "microqueditos → microcréditos" (0,85).
 UMBRAL_SIMILITUD = float(os.environ.get("UMBRAL_SIMILITUD", "0.6"))
+# Nombres propios y siglas: además de estar en el glosario, el original tiene
+# que parecerse (>= 0,4) o figurar en el glosario como variante de ese término.
+# Así cae "violera → Duflo" y pasa "Kabir → Kabeer" (0,50, y además variante).
+UMBRAL_SIMILITUD_NOMBRES = float(os.environ.get("UMBRAL_SIMILITUD_NOMBRES", "0.4"))
 TABLA_GUIONES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-"})
 CARPETA_AUDITORIA = "auditoria"   # CSV local del modo prueba (el workflow lo sube como artefacto)
 SUFIJO_SIN_CORREGIR = " (sin corregir)"    # copia cruda, en _partes
@@ -886,19 +890,55 @@ def preparar_glosario(glosario):
     nombran en clase)"). Los paréntesis sin ':' son variantes erróneas. Los
     títulos de sección ("== CRONOGRAMA (fecha: tema: docente) ==") no cuentan.
     """
-    apodos = set()
-    cuerpo = "\n".join(l for l in (glosario or "").splitlines() if not l.strip().startswith("=="))
-    for contenido in re.findall(r"\(([^()]*)\)", cuerpo):
-        if ":" in contenido:
-            for forma in re.split(r"[,/]", contenido.split(":", 1)[0]):
-                if forma.strip():
-                    apodos.add(forma_comparable(forma.strip()))
-    return {"texto": forma_comparable(glosario or ""), "apodos": apodos}
+    apodos, variantes = set(), {}
+    for linea in (glosario or "").splitlines():
+        if linea.strip().startswith("=="):
+            continue
+        for contenido in re.findall(r"\(([^()]*)\)", linea):
+            if ":" in contenido:
+                for forma in re.split(r"[,/]", contenido.split(":", 1)[0]):
+                    if forma.strip():
+                        apodos.add(forma_comparable(forma.strip()))
+            else:
+                # Variante errónea -> línea del término correcto (ej. "Kabir" -> "Naila Kabeer (...)")
+                for forma in re.split(r"[,/]", contenido):
+                    if forma.strip():
+                        variantes.setdefault(forma_comparable(forma.strip()), []).append(forma_comparable(linea))
+    return {"texto": forma_comparable(glosario or ""), "apodos": apodos, "variantes": variantes}
+
+
+def sin_plural_sigla(termino):
+    """'RCTs' -> 'RCT' (siglas en plural); el resto queda igual."""
+    t = normalizar_guiones(termino.strip())
+    return t[:-1] if re.fullmatch(r"[A-Z0-9-]{2,}s", t) else t
+
+
+def contiene_termino(texto, termino):
+    patron = rf"(?<!\w){re.escape(forma_comparable(termino))}(?!\w)"
+    return bool(texto) and re.search(patron, texto) is not None
 
 
 def esta_en_glosario(termino, info):
-    patron = rf"(?<!\w){re.escape(forma_comparable(termino))}(?!\w)"
-    return bool(info["texto"]) and re.search(patron, info["texto"]) is not None
+    return contiene_termino(info["texto"], termino) or contiene_termino(info["texto"], sin_plural_sigla(termino))
+
+
+def similitud_nombre(original, corregido):
+    """Similitud para nombres: con la misma cantidad de palabras, la PEOR palabra a palabra.
+
+    Así "Mohamed Shams → Muhammad Yunus" da 0,20 (Shams/Yunus) y no 0,50: un
+    apellido distinto no pasa por tener el mismo nombre de pila.
+    """
+    a, b = sin_plural_sigla(original).split(), sin_plural_sigla(corregido).split()
+    if len(a) == len(b) > 1:
+        return min(similitud(x, y) for x, y in zip(a, b))
+    return similitud(" ".join(a), " ".join(b))
+
+
+def es_variante(original, corregido, info):
+    """True si el glosario lista 'original' como variante errónea del término 'corregido'."""
+    lineas = info["variantes"].get(forma_comparable(original), []) + \
+        info["variantes"].get(forma_comparable(sin_plural_sigla(original)), [])
+    return any(contiene_termino(l, corregido) or contiene_termino(l, sin_plural_sigla(corregido)) for l in lineas)
 
 
 def patron_palabra(frase):
@@ -950,9 +990,15 @@ def filtrar_correccion(original, corregido, bloque, info):
         return "no aparece en el bloque"
 
     propio = es_nombre_propio(original, corregido, bloque)
-    if propio:
-        return None if esta_en_glosario(corregido, info) else "nombre propio o sigla fuera del glosario"
-    if propio is None and esta_en_glosario(corregido, info):
+    en_glosario = esta_en_glosario(corregido, info)
+    if propio or (propio is None and en_glosario):
+        if not en_glosario:
+            return "nombre propio o sigla fuera del glosario"
+        if es_variante(original, corregido, info):
+            return None
+        valor = similitud_nombre(original, corregido)
+        if valor < UMBRAL_SIMILITUD_NOMBRES:
+            return f"nombre propio poco parecido ({valor:.2f} < {UMBRAL_SIMILITUD_NOMBRES})"
         return None
     valor = similitud(original, corregido)
     if valor < UMBRAL_SIMILITUD:
