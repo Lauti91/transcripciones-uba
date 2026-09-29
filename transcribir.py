@@ -883,17 +883,21 @@ def similitud(a, b):
 
 
 def preparar_glosario(glosario):
-    """Datos del glosario para el filtro: texto comparable y apodos.
+    """Datos del glosario para el filtro: texto comparable, apodos, variantes y conceptos.
 
     Apodos = formas válidas de trato, escritas en el glosario entre paréntesis
     con una aclaración después de ':' (ej. "Luciana Petrone (Luz, Lu: así la
     nombran en clase)"). Los paréntesis sin ':' son variantes erróneas. Los
     títulos de sección ("== CRONOGRAMA (fecha: tema: docente) ==") no cuentan.
     """
-    apodos, variantes = set(), {}
+    apodos, variantes, conceptos, seccion = set(), {}, [], ""
     for linea in (glosario or "").splitlines():
         if linea.strip().startswith("=="):
+            seccion = forma_comparable(linea)
             continue
+        if "concepto" in seccion or "termino" in seccion:
+            # Sustantivos comunes: van en minúscula a mitad de frase.
+            conceptos.append(forma_comparable(re.sub(r"\([^()]*\)", "", linea)))
         for contenido in re.findall(r"\(([^()]*)\)", linea):
             if ":" in contenido:
                 for forma in re.split(r"[,/]", contenido.split(":", 1)[0]):
@@ -904,7 +908,8 @@ def preparar_glosario(glosario):
                 for forma in re.split(r"[,/]", contenido):
                     if forma.strip():
                         variantes.setdefault(forma_comparable(forma.strip()), []).append(forma_comparable(linea))
-    return {"texto": forma_comparable(glosario or ""), "apodos": apodos, "variantes": variantes}
+    return {"texto": forma_comparable(glosario or ""), "apodos": apodos, "variantes": variantes,
+            "conceptos": conceptos}
 
 
 def sin_plural_sigla(termino):
@@ -988,6 +993,9 @@ def filtrar_correccion(original, corregido, bloque, info):
         return "completa una palabra cortada"
     if not patron_palabra(original).search(bloque):
         return "no aparece en el bloque"
+    if (forma_comparable(original) in info["variantes"] or forma_comparable(sin_plural_sigla(original)) in info["variantes"]) \
+            and not es_variante(original, corregido, info):
+        return "variante de otro término del glosario"
 
     propio = es_nombre_propio(original, corregido, bloque)
     en_glosario = esta_en_glosario(corregido, info)
@@ -1006,14 +1014,52 @@ def filtrar_correccion(original, corregido, bloque, info):
     return None
 
 
-def aplicar_correcciones(bloque, pares):
-    """Aplica las correcciones aceptadas sobre el bloque ORIGINAL, en una sola pasada."""
+def es_concepto(termino, info):
+    """True si el término es un sustantivo común del glosario (sección CONCEPTOS Y TÉRMINOS)."""
+    return any(contiene_termino(c, termino) for c in info.get("conceptos", []))
+
+
+def ajustar_concepto(corregido, info):
+    """'Econometría' -> 'econometría' si es un concepto del glosario escrito solo con mayúscula inicial.
+
+    Devuelve (texto, ajustable): los ajustables se escriben con mayúscula solo
+    a principio de oración (ver aplicar_correcciones).
+    """
+    palabras = corregido.split()
+    if not corregido[:1].isupper() or any(len(p) >= 2 and p.isupper() for p in palabras) or \
+            any(p[:1].isupper() for p in palabras[1:]) or not es_concepto(corregido, info):
+        return corregido, False
+    return corregido[0].lower() + corregido[1:], True
+
+
+def inicio_de_oracion(texto, posicion):
+    antes = texto[:posicion].rstrip()
+    return not antes or antes[-1] in ".!?…¿¡"
+
+
+def aplicar_correcciones(bloque, pares, ajustables=()):
+    """Aplica las correcciones aceptadas sobre el bloque ORIGINAL, en una sola pasada.
+
+    Las correcciones 'ajustables' (conceptos) van en minúscula a mitad de frase
+    y con mayúscula inicial a principio de oración.
+    """
     if not pares:
         return bloque
     reemplazos = dict(pares)
+    for original, nuevo in pares:
+        # Un concepto también se corrige cuando aparece con mayúscula por inicio de oración.
+        if nuevo in ajustables and original[:1].islower():
+            reemplazos.setdefault(original[0].upper() + original[1:], nuevo)
     patron = re.compile("|".join(
         rf"(?<!\w){re.escape(a)}(?!\w)" for a in sorted(reemplazos, key=len, reverse=True)))
-    return patron.sub(lambda m: reemplazos[m.group(0)], bloque)
+
+    def reemplazar(m):
+        nuevo = reemplazos[m.group(0)]
+        if nuevo in ajustables and inicio_de_oracion(bloque, m.start()):
+            nuevo = nuevo[0].upper() + nuevo[1:]
+        return nuevo
+
+    return patron.sub(reemplazar, bloque)
 
 
 def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
@@ -1048,7 +1094,7 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
         try:
             _, propuestas = corregir_bloque(groq_key, bloque, glosario, tema,
                                             {"clase": clase, "n": n, "total": len(bloques)})
-            aceptadas = []
+            aceptadas, ajustables = [], set()
             for original, corregido in propuestas:
                 corregido = normalizar_guiones(corregido)
                 if any(original == a for a, _ in aceptadas):
@@ -1059,8 +1105,12 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
                                              "estado": "aceptada" if regla is None else "descartada",
                                              "regla": regla or ""})
                 if regla is None:
+                    corregido, ajustable = ajustar_concepto(corregido, info)
+                    if ajustable:
+                        ajustables.add(corregido)
+                        resumen["auditoria"][-1]["correccion"] = corregido
                     aceptadas.append((original, corregido))
-            salida.append(aplicar_correcciones(bloque, aceptadas) + sep)
+            salida.append(aplicar_correcciones(bloque, aceptadas, ajustables) + sep)
             correcciones += aceptadas
             resumen["corregidos"] += 1
             fallas_seguidas = 0
