@@ -1,14 +1,17 @@
 """
-Transcripciones UBA: Drive -> Gemini -> Drive
+Transcripciones UBA: Drive -> Groq (Whisper) / Gemini -> Drive
 
 Recorre las materias dentro de la carpeta CLASES de Google Drive (carpetas o
 accesos directos). Para cada audio de clase:
 
-  1. Si no tiene transcripción: lo baja, lo parte en tramos de 40 minutos con
-     ffmpeg y transcribe cada tramo con gemini-3.5-transcribe (que acepta
+  1. Si no tiene transcripción: lo baja, lo parte en tramos de hasta 45 minutos
+     con ffmpeg y transcribe cada tramo con Groq (whisper-large-v3). Si Groq
+     falla o no tiene cuota, usa gemini-3.5-transcribe como respaldo (acepta
      hasta ~50 min por pedido). Cada tramo terminado se guarda en
      Transcripciones/_partes, así que si una corrida se corta, la siguiente
-     retoma desde el tramo que falta. Al final une los tramos y guarda la
+     retoma desde el tramo que falta. Al final une los tramos, los corrige
+     (nombres, términos y ortografía, con el glosario de <materia>/Contexto y
+     gpt-oss-120b en Groq; la versión cruda queda en _partes) y guarda la
      transcripción con el mismo nombre que el audio.
   2. Si tiene transcripción pero no resumen: genera un resumen reestructurado
      con un modelo de texto de Gemini y lo guarda como "<nombre> - resumen".
@@ -19,17 +22,25 @@ Transcripción y resumen se guardan como Google Docs en la subcarpeta
 Variables de entorno necesarias (en GitHub van como secretos):
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN,
   GEMINI_API_KEY, CARPETA_CLASES_ID
+Opcionales:
+  GROQ_API_KEY (sin ella se transcribe solo con Gemini),
+  CARPETA_RESUMENES_SPARK_ID (sin ella se saltea la fase 0),
+  PRUEBA_MATERIA + PRUEBA_GROQ_AUDIO o PRUEBA_CORRECCION_AUDIO (modos de
+  prueba, ver prueba_groq y prueba_correccion).
 """
 
+import csv
 import io
 import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 import requests
@@ -47,7 +58,70 @@ NOMBRE_RESUMENES = "Resúmenes de clase"   # dentro de cada materia (visible par
 SUFIJO_RESUMEN_SPARK = " - Resumen de clase"
 SUFIJO_RESUMEN = " - resumen"
 
-MODELO_TRANSCRIPCION = "gemini-3.5-transcribe"
+MODELO_TRANSCRIPCION = "gemini-3.5-transcribe"   # respaldo si Groq falla
+
+# Transcriptor principal: Groq (API compatible con OpenAI).
+GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+MODELO_GROQ = "whisper-large-v3"
+MAX_BYTES_GROQ = 25 * 1024 * 1024   # límite de archivo de Groq
+TIMEOUT_GROQ_S = 300
+# Si Groq pide esperar más que esto (ej. límite por hora), se usa Gemini.
+MAX_ESPERA_GROQ_S = 180
+SUFIJO_PRUEBA_GROQ = " (groq)"
+
+# Corrección posterior a la transcripción (nombres, términos, ortografía),
+# con el glosario de <materia>/Contexto/Glosario*. Misma GROQ_API_KEY.
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODELO_CORRECCION = "openai/gpt-oss-120b"
+NOMBRE_CONTEXTO = "Contexto"
+# Free tier: 8.000 tokens/min y 200.000/día. Cada pedido lleva prompt +
+# glosario + bloque y devuelve el bloque corregido: con ~1.200 palabras
+# entra holgado en 8.000 (si el glosario es largo, el bloque se achica).
+LIMITE_TOKENS_MINUTO_CORRECCION = 8000
+PALABRAS_POR_BLOQUE = 1200
+TOKENS_POR_PALABRA = 1.5   # estimación conservadora para español
+# Si el bloque corregido cambia mucho de largo, se descarta (usa el original).
+MIN_PROPORCION_CORRECCION = 0.85
+MAX_PROPORCION_CORRECCION = 1.15
+# Filtro de cada corrección propuesta: en palabras comunes, similitud mínima
+# (1 - Levenshtein / largo mayor, sin tildes ni mayúsculas) entre original y
+# corrección. Con 0,6 caen "bota → aborto" (0,50) y "dotes → dotaciones"
+# (0,50) y pasa "microqueditos → microcréditos" (0,85).
+UMBRAL_SIMILITUD = float(os.environ.get("UMBRAL_SIMILITUD", "0.6"))
+# Nombres propios y siglas: además de estar en el glosario, el original tiene
+# que parecerse (>= 0,4) o figurar en el glosario como variante de ese término.
+# Así cae "violera → Duflo" y pasa "Kabir → Kabeer" (0,50, y además variante).
+UMBRAL_SIMILITUD_NOMBRES = float(os.environ.get("UMBRAL_SIMILITUD_NOMBRES", "0.4"))
+TABLA_GUIONES = str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-"})
+CARPETA_AUDITORIA = "auditoria"   # CSV local del modo prueba (el workflow lo sube como artefacto)
+SUFIJO_SIN_CORREGIR = " (sin corregir)"    # copia cruda, en _partes
+SUFIJO_PRUEBA_CORRECCION = " (corregida)"
+SEPARADOR_CORRECCIONES = "────────────────────"
+TITULO_CORRECCIONES = "Correcciones aplicadas"
+
+PROMPT_CORRECCION = """Sos corrector de transcripciones automáticas de clases universitarias de economía (FCE-UBA), grabadas en español rioplatense. Recibís UN bloque de una transcripción hecha con Whisper, el glosario de la materia y el tema de la clase.
+
+Tu tarea es SOLO corregir errores de transcripción:
+- Nombres propios (docentes, autores, instituciones) y términos técnicos mal transcriptos, cuando haya evidencia: que figuren en el glosario (incluidas las variantes erróneas entre paréntesis) o que el contexto inmediato lo deje claro.
+- Ortografía evidente (tildes, letras cambiadas) y puntuación mínima necesaria.
+
+Prohibido:
+- Resumir, acortar, reordenar, agregar contenido o explicaciones.
+- "Arreglar" frases ininteligibles o cortadas inventándoles sentido: dejalas exactamente como están.
+- Cambiar el registro oral o el voseo rioplatense (muletillas, repeticiones y frases coloquiales quedan como están).
+- Traducir términos: si se dijo en inglés, queda en inglés (ej. "Behavioral Economics" queda igual).
+- Expandir abreviaturas o siglas, o completar palabras cortadas (ej. "pol" queda "pol"; "PBG" queda "PBG").
+- Completar o alargar nombres (ej. "David" NO pasa a "David Weil").
+- Cambiar números o su formato (ej. "3" NO pasa a "tres", ni al revés).
+- Cambiar apodos o formas de trato que figuran en el glosario (ej. "Luz" queda "Luz").
+- Corregir un nombre propio o sigla si la forma corregida no está escrita en el glosario.
+- Corregir por adivinanza: si no hay evidencia clara, no toques la palabra.
+
+Ante la duda, dejá el original.
+
+Respondé SOLO con un objeto JSON con dos campos:
+{"texto": "<el bloque completo, corregido>", "correcciones": [{"original": "<como estaba>", "corregido": "<como quedó>"}]}
+Si no hay nada que corregir, devolvé el bloque idéntico y "correcciones": []. En "correcciones" poné cada cambio una sola vez, con la palabra o frase corta afectada (no oraciones enteras)."""
 # Para el resumen: si uno está saturado, se prueba el siguiente.
 MODELOS_RESUMEN = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
 
@@ -132,7 +206,8 @@ TRANSCRIPCIÓN:
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 INICIO = time.time()
-ESTADO = {"sin_cuota_transcripcion": False}
+GLOSARIOS = {}   # carpeta de materia -> texto del glosario (o None)
+ESTADO = {"sin_cuota_gemini": False, "sin_cuota_groq": False, "sin_cuota_correccion": False}
 
 
 def log(msg):
@@ -237,10 +312,10 @@ def leer_texto(drive, item):
     return buf.getvalue().decode("utf-8-sig")
 
 
-def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False):
+def guardar_texto(drive, carpeta_id, nombre, texto, como_doc=False, mime="text/plain"):
     """Guarda un texto en Drive; con como_doc=True lo convierte en Google Doc."""
-    media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype="text/plain", resumable=True)
-    tipo = "application/vnd.google-apps.document" if como_doc else "text/plain"
+    media = MediaIoBaseUpload(io.BytesIO(texto.encode("utf-8")), mimetype=mime, resumable=True)
+    tipo = "application/vnd.google-apps.document" if como_doc else mime
     drive.files().create(
         body={"name": nombre, "parents": [carpeta_id], "mimeType": tipo},
         media_body=media,
@@ -428,12 +503,725 @@ def generar(api_key, modelo, parts, contexto):
 
 
 # ---------------------------------------------------------------------------
+# Groq (Whisper)
+# ---------------------------------------------------------------------------
+
+class SinCuotaGroq(Exception):
+    """Groq agotó su cuota (diaria, o por hora con espera larga): usar Gemini."""
+
+
+def segundos_espera_groq(r):
+    """Segundos que Groq pide esperar (header retry-after o texto 'try again in 1m2.5s')."""
+    try:
+        return float(r.headers.get("retry-after"))
+    except (TypeError, ValueError):
+        pass
+    try:
+        mensaje = r.json().get("error", {}).get("message", "")
+    except ValueError:
+        return None
+    m = re.search(r"try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?", mensaje)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, se = (float(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def revisar_respuesta_groq(r, contexto):
+    if r.status_code == 200:
+        return
+    if r.status_code == 429:
+        try:
+            mensaje = r.json().get("error", {}).get("message", "")
+        except ValueError:
+            mensaje = r.text[:300]
+        espera = segundos_espera_groq(r)
+        if "per day" in mensaje.lower() or "(ASPD)" in mensaje or "(RPD)" in mensaje:
+            raise SinCuotaGroq(f"{contexto}: cuota diaria de Groq agotada.")
+        if espera is not None and espera > MAX_ESPERA_GROQ_S:
+            raise SinCuotaGroq(f"{contexto}: Groq pide esperar {espera / 60:.0f} min (límite de uso).")
+        raise ErrorReintentable("respondió 429 (límite de uso)", espera=espera)
+    if r.status_code >= 500:
+        raise ErrorReintentable(f"respondió {r.status_code}")
+    raise RuntimeError(f"{contexto} respondió {r.status_code}: {r.text[:500]}")
+
+
+def quitar_repeticiones(texto, minimo=4):
+    """Whisper a veces repite la misma frase en silencios largos: deja una sola.
+
+    Solo colapsa frases idénticas consecutivas repetidas 'minimo' veces o más.
+    Devuelve (texto, cantidad de frases quitadas).
+    """
+    frases = re.split(r"(?<=[.!?…])\s+", texto.strip())
+    salida, quitadas, i = [], 0, 0
+    while i < len(frases):
+        j = i
+        while j + 1 < len(frases) and frases[j + 1].strip().lower() == frases[i].strip().lower():
+            j += 1
+        repeticiones = j - i + 1
+        salida.append(frases[i])
+        if repeticiones < minimo:
+            salida += frases[i + 1:j + 1]
+        else:
+            quitadas += repeticiones - 1
+        i = j + 1
+    return " ".join(salida), quitadas
+
+
+def transcribir_con_groq(groq_key, ruta, contexto):
+    tamano = os.path.getsize(ruta)
+    if tamano > MAX_BYTES_GROQ:
+        raise RuntimeError(f"{contexto}: el tramo pesa {tamano / 1024 / 1024:.1f} MB (Groq acepta hasta 25 MB).")
+
+    def _llamar():
+        try:
+            with open(ruta, "rb") as f:
+                r = requests.post(
+                    GROQ_URL,
+                    headers={"Authorization": f"Bearer {groq_key}"},
+                    files={"file": (Path(ruta).name, f, "audio/mpeg")},
+                    data={"model": MODELO_GROQ, "language": "es", "response_format": "text", "temperature": "0"},
+                    timeout=TIMEOUT_GROQ_S,
+                )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            raise ErrorReintentable(f"sin respuesta ({type(e).__name__})") from e
+        revisar_respuesta_groq(r, f"Groq ({contexto})")
+        texto = r.text.strip()
+        if len(texto) < MIN_CARACTERES:
+            raise ErrorReintentable(f"devolvió {len(texto)} caracteres")
+        texto, quitadas = quitar_repeticiones(texto)
+        if quitadas:
+            log(f"AVISO: Groq repitió frases ({contexto}); quité {quitadas} repetición(es).")
+        return texto
+
+    return con_reintentos(f"Groq ({contexto})", _llamar)
+
+
+def transcribir_con_gemini(api_key, ruta, contexto):
+    archivo_gemini = subir_a_gemini(api_key, ruta)
+    try:
+        return generar(
+            api_key,
+            MODELO_TRANSCRIPCION,
+            [{"text": PROMPT_TRANSCRIBIR},
+             {"file_data": {"mime_type": archivo_gemini["mimeType"], "file_uri": archivo_gemini["uri"]}}],
+            contexto,
+        )
+    finally:
+        borrar_de_gemini(api_key, archivo_gemini["name"])
+
+
+def transcribir_tramo(claves, ruta, contexto, solo_groq=False):
+    """Transcribe un tramo con Groq y, si falla, con Gemini. Devuelve (texto, motor)."""
+    groq_key = claves.get("groq")
+    if groq_key and not ESTADO["sin_cuota_groq"]:
+        try:
+            return transcribir_con_groq(groq_key, ruta, contexto), "groq"
+        except SinCuotaGroq as e:
+            ESTADO["sin_cuota_groq"] = True
+            if solo_groq:
+                raise
+            log(f"{e} Sigo con Gemini en esta corrida.")
+        except Exception as e:  # noqa: BLE001
+            if solo_groq:
+                raise
+            log(f"Groq falló ({contexto}): {e}. Pruebo con Gemini.")
+    elif solo_groq:
+        raise RuntimeError("Modo de prueba: falta GROQ_API_KEY o Groq no tiene cuota.")
+
+    if ESTADO["sin_cuota_gemini"]:
+        raise CuotaDiariaAgotada(f"{contexto}: Groq no disponible y cuota diaria de Gemini agotada.")
+    try:
+        return transcribir_con_gemini(claves["gemini"], ruta, contexto), "gemini"
+    except CuotaDiariaAgotada:
+        ESTADO["sin_cuota_gemini"] = True
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Corrección de la transcripción (Groq chat, con glosario de la materia)
+# ---------------------------------------------------------------------------
+
+class SinCuotaCorreccion(Exception):
+    """El modelo de corrección agotó su cuota diaria: se guarda sin corregir."""
+
+
+class BloqueDescartado(Exception):
+    """La respuesta del corrector no es usable para ese bloque (se usa el original)."""
+
+    def __init__(self, mensaje, propuestas=None):
+        super().__init__(mensaje)
+        self.propuestas = propuestas or []
+
+
+def segundos_de_duracion(valor):
+    """'1m2.5s', '7.66s', '150ms', '2' -> segundos (None si no se entiende)."""
+    if valor is None:
+        return None
+    valor = str(valor).strip()
+    try:
+        return float(valor)
+    except ValueError:
+        pass
+    m = re.fullmatch(r"(?:([\d.]+)h)?(?:([\d.]+)m(?!s))?(?:([\d.]+)s)?(?:([\d.]+)ms)?", valor)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, s, ms = (float(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + s + ms / 1000
+
+
+def dividir_en_bloques(texto, palabras=PALABRAS_POR_BLOQUE):
+    """Parte el texto en bloques de ~'palabras' palabras, cortando en fin de oración.
+
+    Devuelve [(bloque, separador)] tal que "".join(b + s) == texto: así los
+    saltos de línea entre tramos se conservan al volver a unir.
+    """
+    piezas = re.split(r"(?<=[.!?…])(\s+)", texto)
+    oraciones = [(piezas[i], piezas[i + 1] if i + 1 < len(piezas) else "") for i in range(0, len(piezas), 2)]
+
+    # Una "oración" gigante (Whisper a veces no pone puntos) se corta por palabras.
+    finas = []
+    for oracion, sep in oraciones:
+        tokens = re.split(r"(\s+)", oracion)
+        if len(tokens) // 2 + 1 <= palabras:
+            finas.append((oracion, sep))
+            continue
+        paso = palabras * 2
+        trozos = ["".join(tokens[i:i + paso]) for i in range(0, len(tokens), paso)]
+        for k, trozo in enumerate(trozos):
+            # El espacio final de cada trozo pasa a ser su separador.
+            limpio = trozo.rstrip()
+            finas.append((limpio, trozo[len(limpio):] if k + 1 < len(trozos) else sep))
+
+    bloques, actual, n_actual = [], "", 0
+    for oracion, sep in finas:
+        n = len(oracion.split())
+        if actual and n_actual + n > palabras:
+            limpio = actual.rstrip()
+            bloques.append((limpio, actual[len(limpio):]))
+            actual, n_actual = "", 0
+        actual += oracion + sep
+        n_actual += n
+    if actual:
+        limpio = actual.rstrip()
+        bloques.append((limpio, actual[len(limpio):]))
+    return bloques
+
+
+def buscar_glosario(drive, carpeta_materia):
+    """Texto del archivo 'Glosario*' en <materia>/Contexto (Google Doc o texto), o None."""
+    contexto = next(
+        (i for i in listar(drive, carpeta_materia)
+         if i["mimeType"] == "application/vnd.google-apps.folder" and normalizar(i["name"]) == normalizar(NOMBRE_CONTEXTO)),
+        None,
+    )
+    if not contexto:
+        return None
+    for item in listar(drive, contexto["id"]):
+        es_texto = item["mimeType"] == "application/vnd.google-apps.document" or item["mimeType"].startswith("text/")
+        if es_texto and normalizar(item["name"]).startswith("glosario"):
+            return leer_texto(drive, item).strip() or None
+    return None
+
+
+def tema_de_clase(glosario, base):
+    """Línea del cronograma del glosario que corresponde a la clase 'dd-mm' (o None).
+
+    La fecha se busca solo antes del primer ':' de cada línea, porque el tema
+    puede mencionar otras fechas ("intercambiada con la del 14-09").
+    """
+    m = re.fullmatch(r"\s*(\d{1,2})[-/.](\d{1,2})\b.*", base or "")
+    if not glosario or not m:
+        return None
+    dia, mes = int(m.group(1)), int(m.group(2))
+    patron = re.compile(rf"(?<!\d)0?{dia}[-/.]0?{mes}(?!\d)")
+    for linea in glosario.splitlines():
+        if ":" in linea and patron.search(linea.split(":", 1)[0]):
+            return linea.strip()
+    return None
+
+
+def palabras_por_bloque(glosario):
+    """Achica los bloques si el glosario es largo, para entrar holgado en el límite por minuto."""
+    # prompt + glosario (~3,5 caracteres por token) + razonamiento del modelo
+    tokens_fijos = (len(PROMPT_CORRECCION) + len(glosario or "")) / 3.5 + 1000
+    disponible = LIMITE_TOKENS_MINUTO_CORRECCION * 0.85 - tokens_fijos
+    # Entrada + salida (texto corregido + lista de correcciones) ≈ 2,1 veces el bloque.
+    return max(200, min(PALABRAS_POR_BLOQUE, int(disponible / (TOKENS_POR_PALABRA * 2.1))))
+
+
+def esperar_limite_minuto(tokens_estimados):
+    """Si el último pedido dejó pocos tokens por minuto, espera a que se renueven."""
+    restantes, renueva_en = ESTADO.get("correccion_restantes"), ESTADO.get("correccion_renueva")
+    if restantes is None or renueva_en is None or restantes >= tokens_estimados:
+        return
+    espera = renueva_en - time.time()
+    if espera > 0:
+        log(f"Corrección: esperando {espera:.0f}s por el límite de tokens por minuto.")
+        time.sleep(espera + 1)
+
+
+def anotar_limites(r):
+    restantes = r.headers.get("x-ratelimit-remaining-tokens")
+    renueva = segundos_de_duracion(r.headers.get("x-ratelimit-reset-tokens"))
+    try:
+        ESTADO["correccion_restantes"] = int(float(restantes)) if restantes is not None else None
+    except ValueError:
+        ESTADO["correccion_restantes"] = None
+    ESTADO["correccion_renueva"] = time.time() + renueva if renueva is not None else None
+
+
+def normalizar_correcciones(lista):
+    """Acepta [{'original','corregido'}], [['a','b']] o ['a → b'] y devuelve [(a, b)]."""
+    pares = []
+    for c in lista if isinstance(lista, list) else []:
+        a = b = None
+        if isinstance(c, dict):
+            a = c.get("original", c.get("de"))
+            b = c.get("corregido", c.get("a", c.get("correccion")))
+        elif isinstance(c, (list, tuple)) and len(c) == 2:
+            a, b = c
+        elif isinstance(c, str):
+            partes = re.split(r"\s*(?:→|->|=>)\s*", c, maxsplit=1)
+            if len(partes) == 2:
+                a, b = partes
+        if isinstance(a, str) and isinstance(b, str) and a.strip() and b.strip() and a.strip() != b.strip():
+            pares.append((a.strip(), b.strip()))
+    return list(dict.fromkeys(pares))
+
+
+def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
+    """Pide la corrección de un bloque. Devuelve (texto, [(original, corregido)])."""
+    usuario = (
+        f"GLOSARIO DE LA MATERIA:\n{glosario or '(no hay glosario para esta materia)'}\n\n"
+        f"CLASE: {contexto['clase']} | TEMA SEGÚN CRONOGRAMA: {tema or 'no figura'}\n\n"
+        f"BLOQUE {contexto['n']} DE {contexto['total']} A CORREGIR:\n<<<\n{bloque}\n>>>"
+    )
+    tokens_bloque = len(bloque.split()) * TOKENS_POR_PALABRA
+    max_salida = int(tokens_bloque * 1.3) + 1500
+    esperar_limite_minuto(int((len(PROMPT_CORRECCION) + len(usuario)) / 3.5) + max_salida)
+
+    def _llamar():
+        try:
+            r = requests.post(
+                GROQ_CHAT_URL,
+                headers={"Authorization": f"Bearer {groq_key}"},
+                json={
+                    "model": MODELO_CORRECCION,
+                    "temperature": 0,
+                    "reasoning_effort": "low",
+                    "max_completion_tokens": max_salida,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": PROMPT_CORRECCION},
+                        {"role": "user", "content": usuario},
+                    ],
+                },
+                timeout=TIMEOUT_GROQ_S,
+            )
+        except (requests.Timeout, requests.ConnectionError) as e:
+            raise ErrorReintentable(f"sin respuesta ({type(e).__name__})") from e
+        anotar_limites(r)
+        if r.status_code == 200:
+            return r.json()
+        try:
+            error = r.json().get("error", {})
+        except ValueError:
+            error = {}
+        mensaje = error.get("message", r.text[:300])
+        if r.status_code == 429:
+            espera = segundos_de_duracion(r.headers.get("retry-after")) or segundos_espera_groq(r)
+            if re.search(r"per day|\((TPD|RPD)\)", mensaje, re.I):
+                raise SinCuotaCorreccion("cuota diaria del corrector agotada.")
+            if espera is not None and espera > MAX_ESPERA_GROQ_S:
+                raise SinCuotaCorreccion(f"el corrector pide esperar {espera / 60:.0f} min.")
+            raise ErrorReintentable("respondió 429 (límite por minuto)", espera=espera)
+        if r.status_code >= 500:
+            raise ErrorReintentable(f"respondió {r.status_code}")
+        if r.status_code == 400 and error.get("code") == "json_validate_failed":
+            raise BloqueDescartado("el modelo no devolvió JSON válido")
+        raise RuntimeError(f"respondió {r.status_code}: {mensaje}")
+
+    respuesta = con_reintentos(f"Corrección ({contexto['clase']}, bloque {contexto['n']}/{contexto['total']})", _llamar)
+    try:
+        contenido = respuesta["choices"][0]["message"]["content"]
+        datos = json.loads(contenido)
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        raise BloqueDescartado(f"JSON ilegible ({type(e).__name__})") from e
+    propuestas = normalizar_correcciones(datos.get("correcciones")) if isinstance(datos, dict) else []
+    texto = datos.get("texto") if isinstance(datos, dict) else None
+    if not isinstance(texto, str) or not texto.strip():
+        raise BloqueDescartado("el JSON no trae 'texto'", propuestas)
+    texto = texto.strip()
+    proporcion = len(texto) / max(1, len(bloque))
+    if not MIN_PROPORCION_CORRECCION <= proporcion <= MAX_PROPORCION_CORRECCION:
+        raise BloqueDescartado(f"largo {proporcion:.0%} del original", propuestas)
+    return texto, propuestas
+
+
+def normalizar_guiones(texto):
+    return texto.translate(TABLA_GUIONES)
+
+
+def forma_comparable(texto):
+    """Minúsculas, sin tildes y con guiones comunes (para comparar con el glosario)."""
+    return normalizar_guiones(normalizar(texto))
+
+
+def similitud(a, b):
+    """1 - distancia de Levenshtein / largo mayor, sobre las formas comparables."""
+    a, b = forma_comparable(a), forma_comparable(b)
+    if not a and not b:
+        return 1.0
+    previa = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        actual = [i]
+        for j, cb in enumerate(b, 1):
+            actual.append(min(previa[j] + 1, actual[j - 1] + 1, previa[j - 1] + (ca != cb)))
+        previa = actual
+    return 1 - previa[-1] / max(len(a), len(b))
+
+
+def preparar_glosario(glosario):
+    """Datos del glosario para el filtro: texto comparable, apodos, variantes y conceptos.
+
+    Apodos = formas válidas de trato, escritas en el glosario entre paréntesis
+    con una aclaración después de ':' (ej. "Luciana Petrone (Luz, Lu: así la
+    nombran en clase)"). Los paréntesis sin ':' son variantes erróneas. Los
+    títulos de sección ("== CRONOGRAMA (fecha: tema: docente) ==") no cuentan.
+    """
+    apodos, variantes, conceptos, seccion = set(), {}, [], ""
+    for linea in (glosario or "").splitlines():
+        if linea.strip().startswith("=="):
+            seccion = forma_comparable(linea)
+            continue
+        if "concepto" in seccion or "termino" in seccion:
+            # Sustantivos comunes: van en minúscula a mitad de frase.
+            conceptos.append(forma_comparable(re.sub(r"\([^()]*\)", "", linea)))
+        for contenido in re.findall(r"\(([^()]*)\)", linea):
+            if ":" in contenido:
+                for forma in re.split(r"[,/]", contenido.split(":", 1)[0]):
+                    if forma.strip():
+                        apodos.add(forma_comparable(forma.strip()))
+            else:
+                # Variante errónea -> línea del término correcto (ej. "Kabir" -> "Naila Kabeer (...)")
+                for forma in re.split(r"[,/]", contenido):
+                    if forma.strip():
+                        variantes.setdefault(forma_comparable(forma.strip()), []).append(forma_comparable(linea))
+    return {"texto": forma_comparable(glosario or ""), "apodos": apodos, "variantes": variantes,
+            "conceptos": conceptos}
+
+
+def sin_plural_sigla(termino):
+    """'RCTs' -> 'RCT' (siglas en plural); el resto queda igual."""
+    t = normalizar_guiones(termino.strip())
+    return t[:-1] if re.fullmatch(r"[A-Z0-9-]{2,}s", t) else t
+
+
+def contiene_termino(texto, termino):
+    patron = rf"(?<!\w){re.escape(forma_comparable(termino))}(?!\w)"
+    return bool(texto) and re.search(patron, texto) is not None
+
+
+def esta_en_glosario(termino, info):
+    return contiene_termino(info["texto"], termino) or contiene_termino(info["texto"], sin_plural_sigla(termino))
+
+
+def similitud_nombre(original, corregido):
+    """Similitud para nombres: con la misma cantidad de palabras, la PEOR palabra a palabra.
+
+    Así "Mohamed Shams → Muhammad Yunus" da 0,20 (Shams/Yunus) y no 0,50: un
+    apellido distinto no pasa por tener el mismo nombre de pila.
+    """
+    a, b = sin_plural_sigla(original).split(), sin_plural_sigla(corregido).split()
+    if len(a) == len(b) > 1:
+        return min(similitud(x, y) for x, y in zip(a, b))
+    return similitud(" ".join(a), " ".join(b))
+
+
+def es_variante(original, corregido, info):
+    """True si el glosario lista 'original' como variante errónea del término 'corregido'."""
+    lineas = info["variantes"].get(forma_comparable(original), []) + \
+        info["variantes"].get(forma_comparable(sin_plural_sigla(original)), [])
+    return any(contiene_termino(l, corregido) or contiene_termino(l, sin_plural_sigla(corregido)) for l in lineas)
+
+
+def patron_palabra(frase):
+    return re.compile(rf"(?<!\w){re.escape(frase)}(?!\w)")
+
+
+def es_nombre_propio(original, corregido, bloque):
+    """True si la corrección es un nombre propio o sigla; None si no se puede saber.
+
+    Una mayúscula al principio de oración no alcanza para decir que es nombre
+    propio: en ese caso devuelve None y decide el glosario.
+    """
+    palabras = re.findall(r"[^\W\d_][\w'-]*", corregido)
+    if not palabras:
+        return False
+    if any(len(p) >= 2 and p.isupper() for p in palabras):
+        return True   # sigla
+    if any(p[0].isupper() for p in palabras[1:]):
+        return True
+    if not palabras[0][0].isupper():
+        return False
+    if not original[:1].isupper():
+        return True   # el modelo le puso mayúscula: lo trata como nombre
+    for m in patron_palabra(original).finditer(bloque):
+        antes = bloque[:m.start()].rstrip()
+        if antes and antes[-1] not in ".!?…¿¡:\"«":
+            return True   # aparece con mayúscula en medio de una oración
+    return None
+
+
+def filtrar_correccion(original, corregido, bloque, info):
+    """Devuelve None si la corrección se acepta, o el nombre de la regla que la descarta."""
+    def solo_letras(t):
+        return "".join(c for c in normalizar_guiones(t).casefold() if c.isalnum())
+
+    if solo_letras(original) == solo_letras(corregido):
+        return "solo formato o puntuación"
+    if sorted(re.findall(r"\d", original)) != sorted(re.findall(r"\d", corregido)) or \
+            (re.search(r"\d", original) and solo_letras(re.sub(r"\d", "", original)) == solo_letras(re.sub(r"\d", "", corregido))):
+        return "cambia números"
+    if len(corregido.split()) > len(original.split()):
+        return "agrega palabras"
+    if forma_comparable(original) in info["apodos"]:
+        return "apodo o forma de trato del glosario"
+    a, b = forma_comparable(original), forma_comparable(corregido)
+    if len(b) > len(a) and b.startswith(a):
+        return "completa una palabra cortada"
+    if not patron_palabra(original).search(bloque):
+        return "no aparece en el bloque"
+    if (forma_comparable(original) in info["variantes"] or forma_comparable(sin_plural_sigla(original)) in info["variantes"]) \
+            and not es_variante(original, corregido, info):
+        return "variante de otro término del glosario"
+
+    propio = es_nombre_propio(original, corregido, bloque)
+    en_glosario = esta_en_glosario(corregido, info)
+    if propio or (propio is None and en_glosario):
+        if not en_glosario:
+            return "nombre propio o sigla fuera del glosario"
+        if es_variante(original, corregido, info):
+            return None
+        valor = similitud_nombre(original, corregido)
+        if valor < UMBRAL_SIMILITUD_NOMBRES:
+            return f"nombre propio poco parecido ({valor:.2f} < {UMBRAL_SIMILITUD_NOMBRES})"
+        return None
+    valor = similitud(original, corregido)
+    if valor < UMBRAL_SIMILITUD:
+        return f"similitud baja ({valor:.2f} < {UMBRAL_SIMILITUD})"
+    return None
+
+
+def es_concepto(termino, info):
+    """True si el término es un sustantivo común del glosario (sección CONCEPTOS Y TÉRMINOS)."""
+    return any(contiene_termino(c, termino) for c in info.get("conceptos", []))
+
+
+def ajustar_concepto(corregido, info):
+    """'Econometría' -> 'econometría' si es un concepto del glosario escrito solo con mayúscula inicial.
+
+    Devuelve (texto, ajustable): los ajustables se escriben con mayúscula solo
+    a principio de oración (ver aplicar_correcciones).
+    """
+    palabras = corregido.split()
+    if not corregido[:1].isupper() or any(len(p) >= 2 and p.isupper() for p in palabras) or \
+            any(p[:1].isupper() for p in palabras[1:]) or not es_concepto(corregido, info):
+        return corregido, False
+    return corregido[0].lower() + corregido[1:], True
+
+
+def inicio_de_oracion(texto, posicion):
+    antes = texto[:posicion].rstrip()
+    return not antes or antes[-1] in ".!?…¿¡"
+
+
+def aplicar_correcciones(bloque, pares, ajustables=()):
+    """Aplica las correcciones aceptadas sobre el bloque ORIGINAL, en una sola pasada.
+
+    Las correcciones 'ajustables' (conceptos) van en minúscula a mitad de frase
+    y con mayúscula inicial a principio de oración.
+    """
+    if not pares:
+        return bloque
+    reemplazos = dict(pares)
+    for original, nuevo in pares:
+        # Un concepto también se corrige cuando aparece con mayúscula por inicio de oración.
+        if nuevo in ajustables and original[:1].islower():
+            reemplazos.setdefault(original[0].upper() + original[1:], nuevo)
+    patron = re.compile("|".join(
+        rf"(?<!\w){re.escape(a)}(?!\w)" for a in sorted(reemplazos, key=len, reverse=True)))
+
+    def reemplazar(m):
+        nuevo = reemplazos[m.group(0)]
+        if nuevo in ajustables and inicio_de_oracion(bloque, m.start()):
+            nuevo = nuevo[0].upper() + nuevo[1:]
+        return nuevo
+
+    return patron.sub(reemplazar, bloque)
+
+
+def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
+    """Corrige la transcripción por bloques. Nunca falla: ante problemas usa el original.
+
+    Devuelve (texto final, correcciones sin repetir, resumen dict).
+    """
+    resumen = {"bloques": 0, "corregidos": 0, "descartados": 0, "sin_corregir": 0, "auditoria": []}
+    if not groq_key or ESTADO["sin_cuota_correccion"]:
+        motivo = "sin GROQ_API_KEY" if not groq_key else "cuota del corrector agotada en esta corrida"
+        log(f"{etiqueta}: se guarda sin corregir ({motivo}).")
+        return texto, [], dict(resumen, sin_corregir=1, motivo=motivo)
+
+    tema = tema_de_clase(glosario, clase)
+    info = preparar_glosario(glosario)
+    palabras = palabras_por_bloque(glosario)
+    bloques = dividir_en_bloques(texto, palabras)
+    resumen["bloques"] = len(bloques)
+    log(f"{etiqueta}: corrigiendo {len(bloques)} bloque(s) de ~{palabras} palabras con {MODELO_CORRECCION} "
+        f"({'con' if glosario else 'sin'} glosario; tema: {tema or 'no figura'}).")
+
+    salida, correcciones, fallas_seguidas, cortar = [], [], 0, None
+    for n, (bloque, sep) in enumerate(bloques, 1):
+        if cortar is None and ESTADO["sin_cuota_correccion"]:
+            cortar = "cuota del corrector agotada"
+        if cortar is None and tiempo_agotado():
+            cortar = "se acabó el tiempo de la corrida"
+        if cortar:
+            salida.append(bloque + sep)
+            resumen["sin_corregir"] += 1
+            continue
+        try:
+            _, propuestas = corregir_bloque(groq_key, bloque, glosario, tema,
+                                            {"clase": clase, "n": n, "total": len(bloques)})
+            aceptadas, ajustables = [], set()
+            for original, corregido in propuestas:
+                corregido = normalizar_guiones(corregido)
+                if any(original == a for a, _ in aceptadas):
+                    regla = "repetida en el bloque"
+                else:
+                    regla = filtrar_correccion(original, corregido, bloque, info)
+                resumen["auditoria"].append({"bloque": n, "original": original, "correccion": corregido,
+                                             "estado": "aceptada" if regla is None else "descartada",
+                                             "regla": regla or ""})
+                if regla is None:
+                    corregido, ajustable = ajustar_concepto(corregido, info)
+                    if ajustable:
+                        ajustables.add(corregido)
+                        resumen["auditoria"][-1]["correccion"] = corregido
+                    aceptadas.append((original, corregido))
+            salida.append(aplicar_correcciones(bloque, aceptadas, ajustables) + sep)
+            correcciones += aceptadas
+            resumen["corregidos"] += 1
+            fallas_seguidas = 0
+            log(f"{etiqueta}: bloque {n}/{len(bloques)}: {len(aceptadas)} de {len(propuestas)} corrección(es) aceptada(s).")
+        except BloqueDescartado as e:
+            salida.append(bloque + sep)
+            resumen["descartados"] += 1
+            for original, corregido in e.propuestas:
+                resumen["auditoria"].append({"bloque": n, "original": original, "correccion": corregido,
+                                             "estado": "descartada", "regla": f"bloque descartado: {e}"})
+            log(f"{etiqueta}: bloque {n}/{len(bloques)} DESCARTADO ({e}); queda el original.")
+        except SinCuotaCorreccion as e:
+            ESTADO["sin_cuota_correccion"] = True
+            salida.append(bloque + sep)
+            resumen["sin_corregir"] += 1
+            log(f"{etiqueta}: {e} El resto queda sin corregir.")
+        except Exception as e:  # noqa: BLE001 - la corrección nunca frena la transcripción
+            salida.append(bloque + sep)
+            resumen["sin_corregir"] += 1
+            fallas_seguidas += 1
+            log(f"{etiqueta}: bloque {n}/{len(bloques)} sin corregir: {e}")
+            if fallas_seguidas >= 2:
+                cortar = "el corrector falló dos bloques seguidos"
+    if cortar:
+        log(f"{etiqueta}: corrección cortada ({cortar}); lo que faltaba queda sin corregir.")
+        resumen["motivo"] = cortar
+
+    unicas = list(dict.fromkeys(correcciones))
+    auditoria = resumen["auditoria"]
+    resumen["propuestas"] = len(auditoria)
+    resumen["filtradas"] = sum(1 for f in auditoria if f["estado"] == "descartada")
+    log(f"{etiqueta}: corrección lista: {resumen['corregidos']} bloque(s) corregido(s), "
+        f"{resumen['descartados']} descartado(s), {resumen['sin_corregir']} sin corregir; "
+        f"{resumen['propuestas']} corrección(es) propuesta(s), {resumen['filtradas']} descartada(s) por el filtro, "
+        f"{len(unicas)} aplicada(s) distinta(s).")
+    return "".join(salida), unicas, resumen
+
+
+def resumen_auditoria(auditoria):
+    """Líneas de resumen: aceptadas y descartadas por regla."""
+    reglas = {}
+    for f in auditoria:
+        if f["estado"] == "descartada":
+            clave = re.sub(r" \(.*\)$", "", f["regla"])
+            reglas[clave] = reglas.get(clave, 0) + 1
+    aceptadas = sum(1 for f in auditoria if f["estado"] == "aceptada")
+    lineas = [f"Auditoría: {len(auditoria)} propuesta(s), {aceptadas} aceptada(s), {len(auditoria) - aceptadas} descartada(s)."]
+    lineas += [f"  descartadas por '{r}': {c}" for r, c in sorted(reglas.items(), key=lambda x: -x[1])]
+    return lineas
+
+
+def auditoria_csv(auditoria):
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=["bloque", "original", "correccion", "estado", "regla"], lineterminator="\n")
+    w.writeheader()
+    w.writerows(auditoria)
+    return buf.getvalue()
+
+
+def seccion_correcciones(correcciones, resumen):
+    lineas = ["", "", SEPARADOR_CORRECCIONES, TITULO_CORRECCIONES,
+              f"(automáticas con {MODELO_CORRECCION}; bloques: {resumen['bloques']}, corregidos: {resumen['corregidos']}, "
+              f"descartados: {resumen['descartados']}, sin corregir: {resumen['sin_corregir']}"
+              + (f"; correcciones propuestas: {resumen['propuestas']}, descartadas por el filtro: {resumen['filtradas']}"
+                 if resumen.get("propuestas") else "")
+              + (f" — {resumen['motivo']}" if resumen.get("motivo") else "") + ")"]
+    lineas += [f"- {a} → {b}" for a, b in correcciones] or ["- ninguna"]
+    return "\n".join(lineas)
+
+
+def quitar_seccion_correcciones(texto):
+    """Saca la sección 'Correcciones aplicadas' de un Doc ya corregido (para re-corregir)."""
+    i = texto.find("\n" + SEPARADOR_CORRECCIONES + "\n" + TITULO_CORRECCIONES)
+    return texto[:i].rstrip() if i >= 0 else texto
+
+
+def normalizar(nombre):
+    """Para comparar nombres ignorando tildes, mayúsculas y espacios de más."""
+    sin_tildes = "".join(
+        c for c in unicodedata.normalize("NFKD", nombre) if not unicodedata.combining(c)
+    )
+    return " ".join(sin_tildes.casefold().split())
+
+
+# ---------------------------------------------------------------------------
 # Procesamiento
 # ---------------------------------------------------------------------------
 
-def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_partes):
+def glosario_de(drive, carpeta_materia, materia):
+    """Glosario de la materia (se lee una vez por corrida)."""
+    if carpeta_materia not in GLOSARIOS:
+        try:
+            GLOSARIOS[carpeta_materia] = buscar_glosario(drive, carpeta_materia)
+        except Exception as e:  # noqa: BLE001 - sin glosario se corrige igual
+            log(f"[{materia}] no pude leer el glosario ({e}); corrijo sin glosario.")
+            GLOSARIOS[carpeta_materia] = None
+        if GLOSARIOS[carpeta_materia] is None:
+            log(f"[{materia}] sin glosario en '{NOMBRE_CONTEXTO}'.")
+    return GLOSARIOS[carpeta_materia]
+
+
+def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_partes, salida=None, solo_groq=False,
+                      carpeta_materia=None):
+    """Transcribe un audio por tramos y guarda el Doc 'salida' (por defecto, el nombre del audio).
+
+    Con carpeta_materia, después de unir los tramos corrige el texto
+    (glosario + Groq chat) y guarda la versión cruda en _partes.
+    """
     base = nombre_base(audio["name"])
-    etiqueta = f"[{materia}] {base}"
+    salida = salida or base
+    etiqueta = f"[{materia}] {salida}"
 
     with tempfile.TemporaryDirectory() as tmp:
         ruta = Path(tmp) / "audio_original"
@@ -446,7 +1234,7 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
         log(f"{etiqueta}: {duracion / 60:.0f} min -> {total} tramo(s) de ~{largo / 60:.0f} min.")
 
         partes_existentes = archivos_por_nombre(drive, carpeta_partes)
-        nombres_partes = [f"{base} - parte {i + 1} de {total}" for i in range(total)]
+        nombres_partes = [f"{salida} - parte {i + 1} de {total}" for i in range(total)]
 
         for i, nombre_parte in enumerate(nombres_partes):
             if nombre_parte in partes_existentes:
@@ -458,29 +1246,28 @@ def transcribir_audio(drive, api_key, materia, audio, carpeta_trans, carpeta_par
 
             tramo = Path(tmp) / f"tramo_{i + 1}.mp3"
             extraer_tramo(ruta, i * (largo - 1), largo, tramo)
-            archivo_gemini = subir_a_gemini(api_key, tramo)
-            try:
-                texto = generar(
-                    api_key,
-                    MODELO_TRANSCRIPCION,
-                    [{"text": PROMPT_TRANSCRIBIR},
-                     {"file_data": {"mime_type": archivo_gemini["mimeType"], "file_uri": archivo_gemini["uri"]}}],
-                    f"{base}, tramo {i + 1}/{total}",
-                )
-            finally:
-                borrar_de_gemini(api_key, archivo_gemini["name"])
+            texto, motor = transcribir_tramo(claves, tramo, f"{salida}, tramo {i + 1}/{total}", solo_groq)
 
             guardar_texto(drive, carpeta_partes, nombre_parte, texto)
             partes_existentes[nombre_parte] = True
-            log(f"{etiqueta}: tramo {i + 1}/{total} OK ({len(texto)} caracteres).")
-            if i + 1 < total:
-                # Cada tramo son ~77.000 tokens: pausa para no pasar el límite por minuto.
+            log(f"{etiqueta}: tramo {i + 1}/{total} OK con {motor} ({len(texto)} caracteres).")
+            if motor == "gemini" and i + 1 < total:
+                # Cada tramo son ~77.000 tokens: pausa para no pasar el límite por minuto de Gemini.
                 time.sleep(PAUSA_ENTRE_TRAMOS_S)
 
-    # Todos los tramos listos: unir, guardar y limpiar
+    # Todos los tramos listos: unir, corregir, guardar y limpiar
     partes = archivos_por_nombre(drive, carpeta_partes)
     textos = [leer_texto(drive, partes[n]).strip() for n in nombres_partes]
-    guardar_texto(drive, carpeta_trans, base, "\n\n".join(textos), como_doc=True)
+    texto = "\n\n".join(textos)
+    if carpeta_materia:
+        if salida + SUFIJO_SIN_CORREGIR not in partes:
+            guardar_texto(drive, carpeta_partes, salida + SUFIJO_SIN_CORREGIR, texto)
+        glosario = glosario_de(drive, carpeta_materia, materia)
+        corregido, correcciones, resumen = corregir_transcripcion(claves.get("groq"), texto, glosario, base, etiqueta)
+        for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
+            log(f"{etiqueta}: {linea}")
+        texto = corregido + seccion_correcciones(correcciones, resumen)
+    guardar_texto(drive, carpeta_trans, salida, texto, como_doc=True)
     for n in nombres_partes:
         a_papelera(drive, partes[n]["id"])
     log(f"{etiqueta}: transcripción completa guardada.")
@@ -520,7 +1307,7 @@ def preparar_materia(drive, materia, carpeta_id):
             audios.append(item)
         else:
             log(f"[{materia}] salteo '{item['name']}' (tipo {item['mimeType']}, no parece audio).")
-    return {"materia": materia, "trans": carpeta_trans, "partes": carpeta_partes, "audios": audios}
+    return {"materia": materia, "carpeta": carpeta_id, "trans": carpeta_trans, "partes": carpeta_partes, "audios": audios}
 
 
 def resumir_pendientes(drive, api_key, m):
@@ -537,7 +1324,12 @@ def resumir_pendientes(drive, api_key, m):
                 log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
 
 
-def transcribir_pendientes(drive, api_key, m):
+def sin_transcriptor():
+    """True si ni Groq ni Gemini pueden transcribir más en esta corrida."""
+    return ESTADO["sin_cuota_gemini"] and ESTADO["sin_cuota_groq"]
+
+
+def transcribir_pendientes(drive, claves, m):
     """Fase 2: transcribir audios sin transcripción (y resumirlos si hay tiempo).
 
     Los pendientes se procesan en orden aleatorio para que un audio
@@ -551,16 +1343,20 @@ def transcribir_pendientes(drive, api_key, m):
         log(f"[{m['materia']}] {len(pendientes)} audio(s) sin transcribir: {', '.join(nombre_base(a['name']) for a in pendientes)}")
 
     for audio in pendientes:
-        if tiempo_agotado() or ESTADO["sin_cuota_transcripcion"]:
+        if tiempo_agotado() or sin_transcriptor():
             return
         base = nombre_base(audio["name"])
         try:
-            if not transcribir_audio(drive, api_key, m["materia"], audio, m["trans"], m["partes"]):
+            if not transcribir_audio(drive, claves, m["materia"], audio, m["trans"], m["partes"],
+                                     carpeta_materia=m["carpeta"]):
                 return
         except CuotaDiariaAgotada as e:
-            ESTADO["sin_cuota_transcripcion"] = True
-            log(f"{e} No se transcribe más hasta que se renueve la cuota.")
-            return
+            ESTADO["sin_cuota_gemini"] = True
+            if sin_transcriptor():
+                log(f"{e} Sin Groq ni Gemini: no se transcribe más hasta que se renueve la cuota.")
+                return
+            log(f"[{m['materia']}] {base}: {e} Sigo con el próximo audio.")
+            continue
         except Exception as e:  # noqa: BLE001 - seguir con el resto aunque uno falle
             log(f"[{m['materia']}] {base}: ERROR al transcribir: {e}")
             continue
@@ -569,7 +1365,7 @@ def transcribir_pendientes(drive, api_key, m):
         nuevos = archivos_por_nombre(drive, m["trans"])
         if HACER_RESUMENES and base in nuevos and not tiempo_agotado():
             try:
-                resumir(drive, api_key, m["materia"], base, nuevos[base], m["trans"])
+                resumir(drive, claves["gemini"], m["materia"], base, nuevos[base], m["trans"])
             except Exception as e:  # noqa: BLE001
                 log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
 
@@ -578,51 +1374,163 @@ def copiar_resumenes_spark(drive, materias):
     """Fase 0: copiar los resúmenes que Gemini Spark dejó en su carpeta privada.
 
     Spark escribe en una carpeta SIN compartir (así no pide confirmación):
-      RESÚMENES SPARK/<materia>/"dd-mm - Resumen de clase"
+      CLASES GRABDAS/<materia>/"dd-mm - Resumen de clase"
     Este paso los copia a CLASES/<materia>/Resúmenes de clase, que sí ve Claude.
-    Se activa definiendo CARPETA_RESUMENES_SPARK_ID (ID de "RESÚMENES SPARK").
+    Se activa definiendo CARPETA_RESUMENES_SPARK_ID (ID de "CLASES GRABDAS").
+    Las subcarpetas se emparejan con las materias ignorando tildes y
+    mayúsculas ("ECONOMETRIA II" = "Econometría II").
     """
     origen_raiz = os.environ.get("CARPETA_RESUMENES_SPARK_ID")
     if not origen_raiz:
         return
-    subcarpetas_spark = {
-        i["name"]: i["id"] for i in listar(drive, origen_raiz)
-        if i["mimeType"] == "application/vnd.google-apps.folder"
-    }
+    subcarpetas_spark = {}
+    for i in listar(drive, origen_raiz):
+        if i["mimeType"] == "application/vnd.google-apps.folder":
+            subcarpetas_spark.setdefault(normalizar(i["name"]), []).append(i["id"])
     for materia, carpeta_id in materias:
-        origen = subcarpetas_spark.get(materia)
-        if not origen:
-            continue
-        try:
-            resumenes = [
-                i for i in listar(drive, origen)
-                if i["mimeType"] == "application/vnd.google-apps.document" and i["name"].endswith(SUFIJO_RESUMEN_SPARK)
-            ]
-            if not resumenes:
-                continue
-            destino = subcarpeta(drive, carpeta_id, NOMBRE_RESUMENES)
-            ya_estan = archivos_por_nombre(drive, destino)
-            for r in resumenes:
-                if r["name"] in ya_estan:
+        for origen in subcarpetas_spark.get(normalizar(materia), []):
+            try:
+                resumenes = [
+                    i for i in listar(drive, origen)
+                    if i["mimeType"] == "application/vnd.google-apps.document" and i["name"].endswith(SUFIJO_RESUMEN_SPARK)
+                ]
+                if not resumenes:
                     continue
-                drive.files().copy(
-                    fileId=r["id"],
-                    body={"name": r["name"], "parents": [destino]},
-                    supportsAllDrives=True,
-                ).execute(num_retries=REINTENTOS_DRIVE)
-                log(f"[{materia}] copiado a '{NOMBRE_RESUMENES}': {r['name']}")
-        except Exception as e:  # noqa: BLE001
-            log(f"[{materia}] ERROR copiando resúmenes de Spark: {e}")
+                destino = subcarpeta(drive, carpeta_id, NOMBRE_RESUMENES)
+                ya_estan = archivos_por_nombre(drive, destino)
+                for r in resumenes:
+                    if r["name"] in ya_estan:
+                        continue
+                    drive.files().copy(
+                        fileId=r["id"],
+                        body={"name": r["name"], "parents": [destino]},
+                        supportsAllDrives=True,
+                    ).execute(num_retries=REINTENTOS_DRIVE)
+                    ya_estan[r["name"]] = r
+                    log(f"[{materia}] copiado a '{NOMBRE_RESUMENES}': {r['name']}")
+            except Exception as e:  # noqa: BLE001
+                log(f"[{materia}] ERROR copiando resúmenes de Spark: {e}")
+
+
+def buscar_materia(drive, materias, materia_buscada):
+    carpeta_id = next((c for n, c in materias if normalizar(n) == normalizar(materia_buscada)), None)
+    if not carpeta_id:
+        sys.exit(f"Modo de prueba: no encontré la materia '{materia_buscada}'.")
+    materia = next(n for n, c in materias if c == carpeta_id)
+    return preparar_materia(drive, materia, carpeta_id)
+
+
+def prueba_groq(drive, claves, materias, materia_buscada, audio_buscado):
+    """Modo de prueba: transcribe un audio puntual SOLO con Groq (sin corrección).
+
+    Guarda el resultado como "<audio> (groq)" en Transcripciones, sin tocar la
+    transcripción existente ni usar Gemini. Si ya existe, no hace nada (borrar
+    ese Doc para repetir la prueba).
+    """
+    if not claves.get("groq"):
+        sys.exit("Modo de prueba: falta GROQ_API_KEY.")
+    m = buscar_materia(drive, materias, materia_buscada)
+    materia = m["materia"]
+    buscado = normalizar(nombre_base(audio_buscado))
+    audio = next((a for a in m["audios"] if normalizar(nombre_base(a["name"])) == buscado), None)
+    if not audio:
+        sys.exit(f"Modo de prueba: no encontré el audio '{audio_buscado}' en {materia}. "
+                 f"Audios: {', '.join(nombre_base(a['name']) for a in m['audios']) or 'ninguno'}")
+
+    salida = nombre_base(audio["name"]) + SUFIJO_PRUEBA_GROQ
+    if salida in archivos_por_nombre(drive, m["trans"]):
+        log(f"[{materia}] '{salida}' ya existe en {NOMBRE_TRANSCRIPCIONES}; no lo piso. Borralo para repetir la prueba.")
+        return
+    log(f"[{materia}] MODO PRUEBA: transcribo '{audio['name']}' solo con Groq -> '{salida}'.")
+    inicio = time.time()
+    try:
+        terminado = transcribir_audio(drive, claves, materia, audio, m["trans"], m["partes"], salida=salida, solo_groq=True)
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"[{materia}] MODO PRUEBA: Groq no pudo transcribir: {str(e).rstrip('.')}. "
+                 f"Los tramos ya hechos quedaron en {NOMBRE_PARTES}; volvé a correr la prueba para seguir.")
+    if terminado:
+        log(f"[{materia}] MODO PRUEBA: listo en {(time.time() - inicio) / 60:.1f} min. "
+            f"Compará '{salida}' con '{nombre_base(audio['name'])}'.")
+
+
+def prueba_correccion(drive, claves, materias, materia_buscada, clase_buscada):
+    """Modo de prueba: corrige la transcripción existente de una clase.
+
+    Guarda "<clase> (corregida)" en Transcripciones sin tocar el original, y
+    lista en el log todas las correcciones. Si ya existe, no hace nada.
+    """
+    if not claves.get("groq"):
+        sys.exit("Modo de prueba: falta GROQ_API_KEY.")
+    m = buscar_materia(drive, materias, materia_buscada)
+    materia = m["materia"]
+    existentes = archivos_por_nombre(drive, m["trans"])
+    buscado = normalizar(nombre_base(clase_buscada))
+    base = next((n for n in existentes if normalizar(n) == buscado), None)
+    if not base:
+        sys.exit(f"Modo de prueba: no hay transcripción '{clase_buscada}' en {materia}/{NOMBRE_TRANSCRIPCIONES}.")
+    salida = base + SUFIJO_PRUEBA_CORRECCION
+    if salida in existentes:
+        log(f"[{materia}] '{salida}' ya existe; no lo piso. Borralo para repetir la prueba.")
+        return
+
+    etiqueta = f"[{materia}] {salida}"
+    log(f"{etiqueta}: MODO PRUEBA: corrijo la transcripción existente '{base}'.")
+    texto = quitar_seccion_correcciones(leer_texto(drive, existentes[base]).strip())
+    glosario = glosario_de(drive, m["carpeta"], materia)
+    inicio = time.time()
+    corregido, correcciones, resumen = corregir_transcripcion(claves["groq"], texto, glosario, base, etiqueta)
+    guardar_texto(drive, m["trans"], salida, corregido + seccion_correcciones(correcciones, resumen), como_doc=True)
+    log(f"{etiqueta}: MODO PRUEBA: guardado en {(time.time() - inicio) / 60:.1f} min. "
+        f"Largo: {len(texto)} -> {len(corregido)} caracteres.")
+    auditoria = resumen["auditoria"]
+    log(f"{etiqueta}: correcciones propuestas por el modelo ({len(auditoria)}):")
+    for f in auditoria:
+        estado = "OK        " if f["estado"] == "aceptada" else "DESCARTADA"
+        log(f"    [{estado}] bloque {f['bloque']}: {f['original']} → {f['correccion']}"
+            + (f"   ({f['regla']})" if f["regla"] else ""))
+
+    # Archivo de auditoría: local (artefacto del workflow) y en _partes
+    contenido = auditoria_csv(auditoria)
+    nombre_csv = f"{salida} - auditoría.csv"
+    os.makedirs(CARPETA_AUDITORIA, exist_ok=True)
+    Path(CARPETA_AUDITORIA, nombre_csv).write_text(contenido, encoding="utf-8")
+    try:
+        guardar_texto(drive, m["partes"], nombre_csv, contenido, mime="text/csv")
+        log(f"{etiqueta}: auditoría guardada en {NOMBRE_TRANSCRIPCIONES}/{NOMBRE_PARTES}/{nombre_csv} "
+            f"y como artefacto del workflow.")
+    except Exception as e:  # noqa: BLE001
+        log(f"{etiqueta}: no pude subir la auditoría a Drive ({e}); queda como artefacto del workflow.")
+    for linea in resumen_auditoria(auditoria):
+        log(f"{etiqueta}: {linea}")
 
 
 def main():
-    api_key = env("GEMINI_API_KEY")
     drive = conectar_drive()
     materias = obtener_materias(drive, env("CARPETA_CLASES_ID"))
+    claves = {"groq": os.environ.get("GROQ_API_KEY"), "gemini": os.environ.get("GEMINI_API_KEY")}
+
+    prueba_materia = os.environ.get("PRUEBA_MATERIA", "").strip()
+    prueba_audio = os.environ.get("PRUEBA_GROQ_AUDIO", "").strip()
+    prueba_corr = os.environ.get("PRUEBA_CORRECCION_AUDIO", "").strip()
+    if prueba_materia or prueba_audio or prueba_corr:
+        if not prueba_materia or not (prueba_audio or prueba_corr) or (prueba_audio and prueba_corr):
+            sys.exit("Modo de prueba: hacen falta la materia y UNO de los dos audios (prueba de Groq o de corrección).")
+        if prueba_audio:
+            prueba_groq(drive, claves, materias, prueba_materia, prueba_audio)
+        else:
+            prueba_correccion(drive, claves, materias, prueba_materia, prueba_corr)
+        log("Fin de la corrida (modo prueba).")
+        return
+
+    claves["gemini"] = env("GEMINI_API_KEY")
+    if not claves["groq"]:
+        ESTADO["sin_cuota_groq"] = True
+        log("AVISO: falta GROQ_API_KEY; se transcribe solo con Gemini.")
     log(f"Materias: {', '.join(m for m, _ in materias) or 'ninguna'}"
+        f" | transcripción: {'Groq, con Gemini de respaldo' if claves['groq'] else 'Gemini'}"
         f" | resúmenes en este script: {'sí' if HACER_RESUMENES else 'no (los hace Gemini Spark)'}")
 
-    # Fase 0: copiar resúmenes de Spark (rápido, no usa Gemini)
+    # Fase 0: copiar resúmenes de Spark (rápido, no usa IA)
     copiar_resumenes_spark(drive, materias)
 
     preparadas = []
@@ -635,7 +1543,7 @@ def main():
     # Fase 1: resúmenes pendientes (solo si están activados en este script)
     for m in (preparadas if HACER_RESUMENES else []):
         try:
-            resumir_pendientes(drive, api_key, m)
+            resumir_pendientes(drive, claves["gemini"], m)
         except Exception as e:  # noqa: BLE001
             log(f"[{m['materia']}] ERROR inesperado en resúmenes: {e}")
 
@@ -645,7 +1553,7 @@ def main():
             log("Tiempo de la corrida agotado; lo pendiente sigue en la próxima.")
             break
         try:
-            transcribir_pendientes(drive, api_key, m)
+            transcribir_pendientes(drive, claves, m)
         except Exception as e:  # noqa: BLE001
             log(f"[{m['materia']}] ERROR inesperado en transcripciones: {e}")
 
