@@ -29,8 +29,9 @@ Variables de entorno necesarias (en GitHub van como secretos):
 Opcionales:
   GROQ_API_KEY (sin ella se transcribe solo con Gemini),
   CARPETA_RESUMENES_SPARK_ID (sin ella se saltea la fase 0),
-  PRUEBA_MATERIA + PRUEBA_GROQ_AUDIO o PRUEBA_CORRECCION_AUDIO (modos de
-  prueba, ver prueba_groq y prueba_correccion).
+  PRUEBA_MATERIA + UNO de PRUEBA_GROQ_AUDIO, PRUEBA_CORRECCION_AUDIO o RECORREGIR_AUDIO
+  (modos manuales, ver prueba_groq, prueba_correccion y recorregir_clase),
+  MAX_PENDIENTES (máximo de clases atrasadas a corregir por corrida).
 """
 
 import csv
@@ -1122,6 +1123,24 @@ def es_nombre_propio(original, corregido, bloque):
     return None
 
 
+def completa_fragmento(palabras_original, palabras_corregidas):
+    """True si alguna palabra del original es el COMIENZO de la palabra corregida (un fragmento completado).
+
+    Se evalúa palabra por palabra ("pa est" -> "país está": pa -> país y est -> está). Para aceptar
+    una completación habría que garantizar que la palabra elegida concuerda en género y número con
+    las vecinas ("los pa" pide "países", no "país"), y eso no se puede garantizar sin un análisis
+    gramatical: ante la duda se descarta. Es preferible un falso descarte a una corrección mala.
+    """
+    def limpia(palabra):
+        return re.sub(r"^\W+|\W+$", "", forma_comparable(palabra))
+
+    for w, c in zip(palabras_original, palabras_corregidas):
+        fw, fc = limpia(w), limpia(c)
+        if fw and len(fc) > len(fw) and fc.startswith(fw):
+            return True
+    return False
+
+
 def filtrar_correccion(original, corregido, bloque, info):
     """Devuelve None si la corrección se acepta, o el nombre de la regla que la descarta."""
     def solo_letras(t):
@@ -1132,12 +1151,18 @@ def filtrar_correccion(original, corregido, bloque, info):
     if sorted(re.findall(r"\d", original)) != sorted(re.findall(r"\d", corregido)) or \
             (re.search(r"\d", original) and solo_letras(re.sub(r"\d", "", original)) == solo_letras(re.sub(r"\d", "", corregido))):
         return "cambia números"
-    if len(corregido.split()) > len(original.split()):
+    palabras_o, palabras_c = original.split(), corregido.split()
+    if len(palabras_c) > len(palabras_o):
         return "agrega palabras"
+    if len(palabras_c) < len(palabras_o):
+        # "Estados Unidos China" -> "Estados Unidos" perdía una palabra de la clase.
+        return "quita palabras"
     if forma_comparable(original) in info["apodos"]:
         return "apodo o forma de trato del glosario"
     a, b = forma_comparable(original), forma_comparable(corregido)
     if len(b) > len(a) and b.startswith(a):
+        return "completa una palabra cortada"
+    if completa_fragmento(palabras_o, palabras_c):
         return "completa una palabra cortada"
     if not patron_palabra(original).search(bloque):
         return "no aparece en el bloque"
@@ -1613,6 +1638,15 @@ def reemplazar_doc(drive, doc, nuevo, previo, etiqueta):
     raise RuntimeError("el Doc no quedó como se escribió; se restauró el contenido anterior")
 
 
+def listar_auditoria_en_log(etiqueta, auditoria):
+    """Una línea por corrección propuesta: aceptada o descartada, y la regla que la descartó."""
+    log(f"{etiqueta}: correcciones propuestas por el modelo ({len(auditoria)}):")
+    for f in auditoria:
+        estado = "OK        " if f["estado"] == "aceptada" else "DESCARTADA"
+        log(f"    [{estado}] bloque {f['bloque']}: {f['original']} → {f['correccion']}"
+            + (f"   ({f['regla']})" if f["regla"] else ""))
+
+
 def informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido, antes, etiqueta):
     """Deja en el log la evidencia de que el Doc se reemplazó en el lugar y de que no quedó nada duplicado."""
     try:
@@ -1644,6 +1678,42 @@ def informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido,
             f"archivos en {NOMBRE_PARTES}: antes {antes[1]}, después {n_partes}.")
     except Exception as e:  # noqa: BLE001
         log(f"{etiqueta}: no pude armar la verificación: {e}")
+
+
+def corregir_y_reemplazar(drive, claves, m, materia, base, doc, actual, original, nombre_crudo, descripcion):
+    """Corrige 'original' (el de _partes) y reemplaza el Doc en el lugar. Devuelve (resultado, resumen).
+
+    resultado: "ok" | "sin_tiempo" (no alcanza el tiempo de la corrida) | "incompleta" (cuota, tiempo o
+    corrector: el Doc queda como estaba) | "guarda" (el largo no cierra: no se reemplaza).
+    Los errores de Drive (incluida la restauración tras una verificación fallida) se propagan.
+    """
+    etiqueta = f"[{materia}] {base}"
+    glosario = glosario_de(drive, m["carpeta"], materia)
+    bloques = math.ceil(len(original.split()) / palabras_por_bloque(glosario))
+    if bloques * MINUTOS_POR_BLOQUE_CORRECCION > minutos_restantes():
+        log(f"{etiqueta}: hacen falta ~{bloques * MINUTOS_POR_BLOQUE_CORRECCION:.0f} min y quedan "
+            f"{max(0, minutos_restantes()):.0f} en esta corrida; sigue en la próxima.")
+        return "sin_tiempo", None
+
+    log(f"{etiqueta}: corrección pendiente ({descripcion}); la rehago entera desde el original.")
+    corregido, correcciones, resumen = corregir_transcripcion(claves["groq"], original, glosario, base, etiqueta)
+    for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
+        log(f"{etiqueta}: {linea}")
+    listar_auditoria_en_log(etiqueta, resumen["auditoria"])
+    if not resumen["completa"]:
+        log(f"{etiqueta}: no se pudo terminar ({resumen.get('motivo', 'ver arriba')}); el Doc queda como estaba. "
+            f"Sigue en la próxima corrida.")
+        return "incompleta", resumen
+    if not corregido.strip() or not MIN_PROPORCION_CORRECCION <= len(corregido) / len(original) <= MAX_PROPORCION_CORRECCION:
+        log(f"{etiqueta}: ERROR: el texto corregido mide {len(corregido)} caracteres contra {len(original)} "
+            f"del original; no reemplazo el Doc.")
+        return "guarda", resumen
+    antes = (len(listar(drive, m["trans"])), len(listar(drive, m["partes"])))
+    reemplazar_doc(drive, doc, corregido + seccion_correcciones(correcciones, resumen), actual, etiqueta)
+    CORREGIDOS_EN_ESTA_CORRIDA.add((materia, base))
+    informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido, antes, etiqueta)
+    log(f"{etiqueta}: Doc corregido y reemplazado en el lugar (mismo archivo).")
+    return "ok", resumen
 
 
 def corregir_pendientes(drive, claves, preparadas):
@@ -1714,33 +1784,14 @@ def corregir_pendientes(drive, claves, preparadas):
                 log(f"{etiqueta}: el original está vacío; no lo toco.")
                 continue
 
-            glosario = glosario_de(drive, m["carpeta"], materia)
-            bloques = math.ceil(len(original.split()) / palabras_por_bloque(glosario))
-            if bloques * MINUTOS_POR_BLOQUE_CORRECCION > minutos_restantes():
-                log(f"{etiqueta}: hacen falta ~{bloques * MINUTOS_POR_BLOQUE_CORRECCION:.0f} min y quedan "
-                    f"{max(0, minutos_restantes()):.0f} en esta corrida; sigue en la próxima.")
+            resultado, _ = corregir_y_reemplazar(drive, claves, m, materia, base, doc, actual, original, nombre_crudo,
+                                                 "sin corregir" if estado == "sin" else "corrección parcial")
+            if resultado in ("sin_tiempo", "incompleta"):
                 break
-
-            log(f"{etiqueta}: corrección pendiente ({'sin corregir' if estado == 'sin' else 'corrección parcial'}); "
-                f"la rehago entera desde el original.")
-            corregido, correcciones, resumen = corregir_transcripcion(claves["groq"], original, glosario, base, etiqueta)
-            for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
-                log(f"{etiqueta}: {linea}")
-            if not resumen["completa"]:
-                log(f"{etiqueta}: no se pudo terminar ({resumen.get('motivo', 'ver arriba')}); el Doc queda como estaba. "
-                    f"Sigue en la próxima corrida.")
-                break
-            if not corregido.strip() or not MIN_PROPORCION_CORRECCION <= len(corregido) / len(original) <= MAX_PROPORCION_CORRECCION:
-                log(f"{etiqueta}: ERROR: el texto corregido mide {len(corregido)} caracteres contra {len(original)} "
-                    f"del original; no reemplazo el Doc.")
+            if resultado == "guarda":
                 continue
-            antes = (len(listar(drive, m["trans"])), len(listar(drive, m["partes"])))
-            reemplazar_doc(drive, doc, corregido + seccion_correcciones(correcciones, resumen), actual, etiqueta)
-            CORREGIDOS_EN_ESTA_CORRIDA.add((materia, base))
-            informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido, antes, etiqueta)
             hechos += 1
             fallos = 0
-            log(f"{etiqueta}: Doc corregido y reemplazado en el lugar (mismo archivo).")
         except Exception as e:  # noqa: BLE001 - la fase de pendientes nunca frena la corrida
             fallos += 1
             log(f"{etiqueta}: ERROR al corregir el pendiente: {e}")
@@ -1863,11 +1914,7 @@ def prueba_correccion(drive, claves, materias, materia_buscada, clase_buscada):
     log(f"{etiqueta}: MODO PRUEBA: guardado en {(time.time() - inicio) / 60:.1f} min. "
         f"Largo: {len(texto)} -> {len(corregido)} caracteres.")
     auditoria = resumen["auditoria"]
-    log(f"{etiqueta}: correcciones propuestas por el modelo ({len(auditoria)}):")
-    for f in auditoria:
-        estado = "OK        " if f["estado"] == "aceptada" else "DESCARTADA"
-        log(f"    [{estado}] bloque {f['bloque']}: {f['original']} → {f['correccion']}"
-            + (f"   ({f['regla']})" if f["regla"] else ""))
+    listar_auditoria_en_log(etiqueta, auditoria)
 
     # Archivo de auditoría: local (artefacto del workflow) y en _partes
     contenido = auditoria_csv(auditoria)
@@ -1884,6 +1931,45 @@ def prueba_correccion(drive, claves, materias, materia_buscada, clase_buscada):
         log(f"{etiqueta}: {linea}")
 
 
+def recorregir_clase(drive, claves, materias, materia_buscada, clase_buscada):
+    """Rehace la corrección de una clase desde su original de _partes y reemplaza el Doc EN EL LUGAR.
+
+    Sirve para volver a corregir un Doc que ya figura como completo (por ejemplo, después de cambiar
+    las reglas del filtro). Necesita "<clase> (sin corregir)" en _partes. Deja en el log todas las
+    correcciones propuestas (aceptadas y descartadas), la verificación del reemplazo y un CSV local
+    (artefacto del workflow). Si no se puede terminar, el Doc queda como estaba y la corrida falla.
+    """
+    if not claves.get("groq"):
+        sys.exit("Recorregir: falta GROQ_API_KEY.")
+    m = buscar_materia(drive, materias, materia_buscada)
+    materia = m["materia"]
+    existentes = archivos_por_nombre(drive, m["trans"])
+    buscado = normalizar(nombre_base(clase_buscada))
+    base = next((n for n in existentes if normalizar(n) == buscado), None)
+    if not base or existentes[base]["mimeType"] != MIME_DOC:
+        sys.exit(f"Recorregir: no hay un Doc '{clase_buscada}' en {materia}/{NOMBRE_TRANSCRIPCIONES}.")
+    doc = existentes[base]
+    nombre_crudo = base + SUFIJO_SIN_CORREGIR
+    partes = archivos_por_nombre(drive, m["partes"])
+    if nombre_crudo not in partes:
+        sys.exit(f"Recorregir: no está el original '{nombre_crudo}' en {NOMBRE_PARTES}; no se toca el Doc.")
+    original = leer_texto(drive, partes[nombre_crudo]).strip()
+    actual = leer_texto(drive, doc).strip()
+    if not original:
+        sys.exit("Recorregir: el original está vacío; no se toca el Doc.")
+    etiqueta = f"[{materia}] {base}"
+    log(f"{etiqueta}: RECORREGIR: estado actual del Doc: {estado_correccion(actual)}; original en {NOMBRE_PARTES}: "
+        f"{len(original)} caracteres; Doc actual: {len(actual)}.")
+    resultado, resumen = corregir_y_reemplazar(drive, claves, m, materia, base, doc, actual, original, nombre_crudo,
+                                               "recorrección pedida a mano")
+    if resumen:
+        os.makedirs(CARPETA_AUDITORIA, exist_ok=True)
+        Path(CARPETA_AUDITORIA, f"{base.strip()} - recorrección - auditoría.csv").write_text(
+            auditoria_csv(resumen["auditoria"]), encoding="utf-8")
+    if resultado != "ok":
+        sys.exit(f"{etiqueta}: RECORREGIR: no se reemplazó el Doc ({resultado}).")
+
+
 def main():
     drive = conectar_drive()
     materias = obtener_materias(drive, env("CARPETA_CLASES_ID"))
@@ -1892,14 +1978,19 @@ def main():
     prueba_materia = os.environ.get("PRUEBA_MATERIA", "").strip()
     prueba_audio = os.environ.get("PRUEBA_GROQ_AUDIO", "").strip()
     prueba_corr = os.environ.get("PRUEBA_CORRECCION_AUDIO", "").strip()
-    if prueba_materia or prueba_audio or prueba_corr:
-        if not prueba_materia or not (prueba_audio or prueba_corr) or (prueba_audio and prueba_corr):
-            sys.exit("Modo de prueba: hacen falta la materia y UNO de los dos audios (prueba de Groq o de corrección).")
+    recorregir = os.environ.get("RECORREGIR_AUDIO", "").strip()
+    pedidos = [x for x in (prueba_audio, prueba_corr, recorregir) if x]
+    if prueba_materia or pedidos:
+        if not prueba_materia or len(pedidos) != 1:
+            sys.exit("Modo manual: hacen falta la materia y UNO solo de estos: prueba de Groq, prueba de corrección "
+                     "o recorregir en el lugar.")
         if prueba_audio:
             prueba_groq(drive, claves, materias, prueba_materia, prueba_audio)
-        else:
+        elif prueba_corr:
             prueba_correccion(drive, claves, materias, prueba_materia, prueba_corr)
-        log("Fin de la corrida (modo prueba).")
+        else:
+            recorregir_clase(drive, claves, materias, prueba_materia, recorregir)
+        log("Fin de la corrida (modo manual).")
         return
 
     claves["gemini"] = env("GEMINI_API_KEY")

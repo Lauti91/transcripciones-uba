@@ -17,6 +17,10 @@ on:
         description: "PRUEBA CORRECCIÓN: clase ya transcripta (ej. 24-09). Se guarda como '<clase> (corregida)'."
         required: false
         default: ""
+      recorregir_audio:
+        description: "RECORREGIR EN EL LUGAR: clase (con su original en _partes) que se rehace y REEMPLAZA su Doc. Junto con prueba_materia."
+        required: false
+        default: ""
       max_pendientes:
         description: "Corrida normal: máximo de clases atrasadas a corregir (reemplaza el Doc en el lugar). Vacío = sin límite; 1 = prueba."
         required: false
@@ -47,6 +51,9 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
+      - name: Probar el filtro de correcciones (regresión)
+        run: python tests/test_filtro_correcciones.py
+
       - name: Transcribir y resumir
         env:
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -60,10 +67,11 @@ jobs:
           PRUEBA_GROQ_AUDIO: ${{ inputs.prueba_groq_audio }}
           PRUEBA_CORRECCION_AUDIO: ${{ inputs.prueba_correccion_audio }}
           MAX_PENDIENTES: ${{ inputs.max_pendientes }}
+          RECORREGIR_AUDIO: ${{ inputs.recorregir_audio }}
         run: python transcribir.py
 
       - name: Subir auditoría de la corrección (modo prueba)
-        if: always() && inputs.prueba_correccion_audio != ''
+        if: always() && (inputs.prueba_correccion_audio != '' || inputs.recorregir_audio != '')
         uses: actions/upload-artifact@v4
         with:
           name: auditoria-correccion
