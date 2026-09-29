@@ -971,10 +971,12 @@ def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
         mensaje = error.get("message", r.text[:300])
         if r.status_code == 429:
             espera = segundos_de_duracion(r.headers.get("retry-after")) or segundos_espera_groq(r)
+            # El mensaje de Groq dice cuánto se usó y cuándo se renueva; se muestra sin el ID de organización (log público).
+            detalle = re.sub(r"organization `[^`]*`", "organization `…`", mensaje)[:300]
             if re.search(r"per day|\((TPD|RPD)\)", mensaje, re.I):
-                raise SinCuotaCorreccion("cuota diaria del corrector agotada.")
+                raise SinCuotaCorreccion(f"cuota diaria del corrector agotada (Groq dice: {detalle}).")
             if espera is not None and espera > MAX_ESPERA_GROQ_S:
-                raise SinCuotaCorreccion(f"el corrector pide esperar {espera / 60:.0f} min.")
+                raise SinCuotaCorreccion(f"el corrector pide esperar {espera / 60:.0f} min (Groq dice: {detalle}).")
             raise ErrorReintentable("respondió 429 (límite por minuto)", espera=espera)
         if r.status_code >= 500:
             raise ErrorReintentable(f"respondió {r.status_code}")
