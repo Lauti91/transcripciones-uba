@@ -228,6 +228,7 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com"
 INICIO = time.time()
 GLOSARIOS = {}   # carpeta de materia -> texto del glosario (o None)
 MIME_DOC = "application/vnd.google-apps.document"
+USO_CORRECCION = {"prompt": 0, "completion": 0, "pedidos": 0}   # tokens reales que informa Groq, acumulados en la corrida
 CORREGIDOS_EN_ESTA_CORRIDA = set()   # (materia, nombre del Doc) ya corregidos completos: la fase de pendientes no los relee
 ESTADO = {"sin_cuota_gemini": False, "sin_cuota_groq": False, "sin_cuota_correccion": False}
 
@@ -981,6 +982,11 @@ def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
         raise RuntimeError(f"respondió {r.status_code}: {mensaje}")
 
     respuesta = con_reintentos(f"Corrección ({contexto['clase']}, bloque {contexto['n']}/{contexto['total']})", _llamar)
+    uso = respuesta.get("usage") if isinstance(respuesta, dict) else None
+    if isinstance(uso, dict):
+        USO_CORRECCION["prompt"] += int(uso.get("prompt_tokens") or 0)
+        USO_CORRECCION["completion"] += int(uso.get("completion_tokens") or 0)
+        USO_CORRECCION["pedidos"] += 1
     try:
         contenido = respuesta["choices"][0]["message"]["content"]
         datos = json.loads(contenido)
@@ -1232,6 +1238,7 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
             f"(≈ {len(prep['fijo']) / 3.5:.0f}) más las entradas relacionadas "
             f"({len(prep['entradas'])} entradas en total).")
     enviados = []   # caracteres de glosario mandados en cada bloque
+    uso_antes = dict(USO_CORRECCION)
 
     salida, correcciones, fallas_seguidas, cortar = [], [], 0, None
     for n, (bloque, sep) in enumerate(bloques, 1):
@@ -1296,6 +1303,12 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
     unicas = list(dict.fromkeys(correcciones))
     auditoria = resumen["auditoria"]
     resumen["propuestas"] = len(auditoria)
+    pedidos = USO_CORRECCION["pedidos"] - uso_antes["pedidos"]
+    if pedidos:
+        entrada = USO_CORRECCION["prompt"] - uso_antes["prompt"]
+        salida_tok = USO_CORRECCION["completion"] - uso_antes["completion"]
+        log(f"{etiqueta}: tokens reales de Groq en esta clase: entrada {entrada} + salida {salida_tok} = {entrada + salida_tok} "
+            f"en {pedidos} pedido(s) (≈ {(entrada + salida_tok) / pedidos:.0f} por bloque).")
     if enviados:
         log(f"{etiqueta}: glosario mandado por bloque: ≈ {sum(enviados) / len(enviados) / 3.5:.0f} tokens en promedio "
             f"(máximo ≈ {max(enviados) / 3.5:.0f}; completo ≈ {prep['caracteres_totales'] / 3.5:.0f}).")
@@ -1600,6 +1613,39 @@ def reemplazar_doc(drive, doc, nuevo, previo, etiqueta):
     raise RuntimeError("el Doc no quedó como se escribió; se restauró el contenido anterior")
 
 
+def informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido, antes, etiqueta):
+    """Deja en el log la evidencia de que el Doc se reemplazó en el lugar y de que no quedó nada duplicado."""
+    try:
+        en_trans = listar(drive, m["trans"])
+        mismos = [i for i in en_trans if i["name"] == doc["name"]]
+        identico = len(mismos) == 1 and mismos[0]["id"] == doc["id"] and mismos[0]["name"] == doc["name"]
+        ids_despues = ", ".join(i["id"] for i in mismos) or "(no aparece)"
+        nombre_despues = repr(mismos[0]["name"]) if mismos else "-"
+        tipo_despues = mismos[0]["mimeType"] if mismos else "-"
+        veredicto = "IDÉNTICOS" if identico else "DISTINTOS"
+        log(f"{etiqueta}: VERIFICACIÓN 1 (mismo archivo): antes id={doc['id']} nombre={doc['name']!r}; "
+            f"después id={ids_despues} nombre={nombre_despues} tipo={tipo_despues} -> {veredicto}.")
+        crudo = next((i for i in listar(drive, m["partes"]) if i["name"] == nombre_crudo), None)
+        if crudo:
+            n_crudo = len(leer_texto(drive, crudo).strip())
+            log(f"{etiqueta}: VERIFICACIÓN 2 (original): en {NOMBRE_PARTES} está {nombre_crudo!r} (id={crudo['id']}, "
+                f"{n_crudo} caracteres, {'igual' if n_crudo == len(original) else 'DISTINTO'} al usado para corregir).")
+        else:
+            log(f"{etiqueta}: VERIFICACIÓN 2 (original): FALTA {nombre_crudo!r} en {NOMBRE_PARTES}.")
+        leido = leer_texto(drive, doc).strip()
+        log(f"{etiqueta}: VERIFICACIÓN 3 (largo): original {len(original)} caracteres; corregido {len(corregido)} "
+            f"({len(corregido) / len(original):.1%} del original); Doc antes {len(actual)}; Doc después, releído de Drive, "
+            f"{len(leido)} ({len(leido) / len(original):.1%} del original, incluye la sección de correcciones).")
+        log(f"{etiqueta}: VERIFICACIÓN 4 (marca): sección '{TITULO_CORRECCIONES}' "
+            f"{'presente' if estado_correccion(leido) != 'sin' else 'AUSENTE'}; estado según el Doc: {estado_correccion(leido)}.")
+        n_partes = len(listar(drive, m["partes"]))
+        log(f"{etiqueta}: VERIFICACIÓN 5 (duplicados): Docs llamados {doc['name']!r} en {NOMBRE_TRANSCRIPCIONES}: {len(mismos)}; "
+            f"archivos en {NOMBRE_TRANSCRIPCIONES}: antes {antes[0]}, después {len(en_trans)}; "
+            f"archivos en {NOMBRE_PARTES}: antes {antes[1]}, después {n_partes}.")
+    except Exception as e:  # noqa: BLE001
+        log(f"{etiqueta}: no pude armar la verificación: {e}")
+
+
 def corregir_pendientes(drive, claves, preparadas):
     """Fase 3: corregir los Docs que quedaron sin corregir, reemplazándolos en el lugar.
 
@@ -1688,8 +1734,10 @@ def corregir_pendientes(drive, claves, preparadas):
                 log(f"{etiqueta}: ERROR: el texto corregido mide {len(corregido)} caracteres contra {len(original)} "
                     f"del original; no reemplazo el Doc.")
                 continue
+            antes = (len(listar(drive, m["trans"])), len(listar(drive, m["partes"])))
             reemplazar_doc(drive, doc, corregido + seccion_correcciones(correcciones, resumen), actual, etiqueta)
             CORREGIDOS_EN_ESTA_CORRIDA.add((materia, base))
+            informar_reemplazo(drive, m, doc, nombre_crudo, actual, original, corregido, antes, etiqueta)
             hechos += 1
             fallos = 0
             log(f"{etiqueta}: Doc corregido y reemplazado en el lugar (mismo archivo).")
