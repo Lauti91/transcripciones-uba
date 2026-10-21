@@ -24,12 +24,15 @@ Variables de entorno necesarias (en GitHub van como secretos):
   GEMINI_API_KEY, CARPETA_CLASES_ID
 Opcionales:
   GROQ_API_KEY (sin ella se transcribe solo con Gemini),
+  GROQ_API_KEY_AMIGA + MATERIAS_AMIGA (nombres de carpeta de materia separados
+  por coma: esas materias usan la key de la otra persona; ver ResolutorGroq),
   CARPETA_RESUMENES_SPARK_ID (sin ella se saltea la fase 0),
   PRUEBA_MATERIA + PRUEBA_GROQ_AUDIO o PRUEBA_CORRECCION_AUDIO (modos de
   prueba, ver prueba_groq y prueba_correccion).
 """
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -207,10 +210,14 @@ TRANSCRIPCIÓN:
 GEMINI_BASE = "https://generativelanguage.googleapis.com"
 INICIO = time.time()
 GLOSARIOS = {}   # carpeta de materia -> texto del glosario (o None)
-ESTADO = {"sin_cuota_gemini": False, "sin_cuota_groq": False, "sin_cuota_correccion": False}
+ESTADO = {"sin_cuota_gemini": False}   # Gemini: una sola key para todos
+SECRETOS = set()   # valores de keys: nunca se imprimen (log los tapa)
 
 
 def log(msg):
+    msg = str(msg)
+    for secreto in SECRETOS:
+        msg = msg.replace(secreto, "***")
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
@@ -506,6 +513,122 @@ def generar(api_key, modelo, parts, contexto):
 # Groq (Whisper)
 # ---------------------------------------------------------------------------
 
+ESTADOS_GROQ = {}   # identidad de la key (SHA-256 de su valor) -> estado de cuotas de ESA key
+
+
+class ClaveGroq:
+    """Una key de Groq con su etiqueta ("propia" / "amiga").
+
+    El estado (cuota de transcripción, cuota diaria y presupuesto por minuto de
+    la corrección, rechazo 401/403) vive en ESTADOS_GROQ, indexado por la
+    IDENTIDAD de la key (hash de su valor) y no por la etiqueta: dos etiquetas
+    que terminen apuntando a la misma key comparten estado. Nunca se imprime el
+    valor: solo la etiqueta.
+    """
+
+    def __init__(self, etiqueta, valor):
+        self.etiqueta = etiqueta
+        self.valor = valor
+        self.identidad = hashlib.sha256(valor.encode("utf-8")).hexdigest()
+        if len(valor) >= 8:
+            SECRETOS.add(valor)
+        self.estado = ESTADOS_GROQ.setdefault(self.identidad, {
+            "sin_cuota_groq": False,        # Whisper: cuota agotada en esta corrida
+            "sin_cuota_correccion": False,  # chat: cuota diaria agotada en esta corrida
+            "restantes": None,              # tokens por minuto que quedaban en el último pedido
+            "renueva": None,                # cuándo se renuevan (time.time())
+            "limite_minuto": LIMITE_TOKENS_MINUTO_CORRECCION,
+            "rechazada": None,              # 401/403 recibido con esta key
+        })
+
+    def __repr__(self):
+        return f"ClaveGroq({self.etiqueta})"
+
+
+class ClaveRechazada(RuntimeError):
+    """Groq respondió 401/403: la key no sirve (o no tiene permiso)."""
+
+    def __init__(self, mensaje, status):
+        super().__init__(mensaje)
+        self.status = status
+
+
+class ResolutorGroq:
+    """Decide qué key de Groq usa cada materia.
+
+    Las materias de MATERIAS_AMIGA usan la key de la otra persona si existe y
+    no fue rechazada; en cualquier otro caso se usa la propia. Los nombres se
+    comparan sin tildes, mayúsculas ni espacios de más.
+    """
+
+    def __init__(self, propia=None, amiga=None, materias_amiga=()):
+        self.propia = propia
+        self.amiga = amiga
+        self.materias_amiga = {normalizar(n) for n in materias_amiga if n.strip()}
+        self._avisados = set()
+
+    @classmethod
+    def desde_entorno(cls):
+        propia, amiga = os.environ.get("GROQ_API_KEY"), os.environ.get("GROQ_API_KEY_AMIGA")
+        nombres = [n.strip() for n in os.environ.get("MATERIAS_AMIGA", "").split(",") if n.strip()]
+        return cls(ClaveGroq("propia", propia) if propia else None,
+                   ClaveGroq("amiga", amiga) if amiga else None, nombres)
+
+    def es_de_amiga(self, materia):
+        return bool(materia) and normalizar(materia) in self.materias_amiga
+
+    def persona(self, materia):
+        return "amiga" if self.es_de_amiga(materia) else "propia"
+
+    def _avisar_fallback(self, motivo):
+        if motivo not in self._avisados:
+            self._avisados.add(motivo)
+            log(f"AVISO: fallback a key propia por {motivo}.")
+
+    def para(self, materia):
+        """ClaveGroq de la materia, o None si no hay ninguna disponible."""
+        if self.es_de_amiga(materia):
+            if self.amiga is None:
+                self._avisar_fallback("falta GROQ_API_KEY_AMIGA")
+            elif self.amiga.estado["rechazada"]:
+                self._avisar_fallback(f"rechazo {self.amiga.estado['rechazada']} de la key de la amiga")
+            else:
+                return self.amiga
+        return self.propia
+
+    def rechazar(self, clave, status):
+        """Anota un 401/403 de 'clave'. True si conviene reintentar con otra key."""
+        if self.amiga is None or clave.etiqueta != "amiga":
+            return False
+        self.amiga.estado["rechazada"] = status
+        if self.propia is None:
+            log(f"AVISO: la key de la amiga fue rechazada ({status}) y no hay key propia; "
+                f"esas materias siguen sin Groq (con Gemini).")
+            return False
+        self._avisar_fallback(f"rechazo {status} de la key de la amiga")
+        return self.propia.identidad != self.amiga.identidad
+
+
+GROQ = ResolutorGroq()   # main() lo reemplaza con las keys del entorno
+
+
+def con_clave_groq(materia, operacion):
+    """Ejecuta operacion(clave) con la key de la materia -> (resultado, clave usada).
+
+    Si la key de la amiga es rechazada (401/403), pasa a la propia y repite.
+    Cualquier otro error se propaga igual que antes.
+    """
+    while True:
+        clave = GROQ.para(materia)
+        if clave is None:
+            raise RuntimeError("no hay key de Groq para esta materia")
+        try:
+            return operacion(clave), clave
+        except ClaveRechazada as e:
+            if not GROQ.rechazar(clave, e.status):
+                raise
+
+
 class SinCuotaGroq(Exception):
     """Groq agotó su cuota (diaria, o por hora con espera larga): usar Gemini."""
 
@@ -543,6 +666,8 @@ def revisar_respuesta_groq(r, contexto):
         raise ErrorReintentable("respondió 429 (límite de uso)", espera=espera)
     if r.status_code >= 500:
         raise ErrorReintentable(f"respondió {r.status_code}")
+    if r.status_code in (401, 403):
+        raise ClaveRechazada(f"{contexto} respondió {r.status_code}: {r.text[:500]}", r.status_code)
     raise RuntimeError(f"{contexto} respondió {r.status_code}: {r.text[:500]}")
 
 
@@ -568,7 +693,7 @@ def quitar_repeticiones(texto, minimo=4):
     return " ".join(salida), quitadas
 
 
-def transcribir_con_groq(groq_key, ruta, contexto):
+def transcribir_con_groq(clave, ruta, contexto):
     tamano = os.path.getsize(ruta)
     if tamano > MAX_BYTES_GROQ:
         raise RuntimeError(f"{contexto}: el tramo pesa {tamano / 1024 / 1024:.1f} MB (Groq acepta hasta 25 MB).")
@@ -578,14 +703,18 @@ def transcribir_con_groq(groq_key, ruta, contexto):
             with open(ruta, "rb") as f:
                 r = requests.post(
                     GROQ_URL,
-                    headers={"Authorization": f"Bearer {groq_key}"},
+                    headers={"Authorization": f"Bearer {clave.valor}"},
                     files={"file": (Path(ruta).name, f, "audio/mpeg")},
                     data={"model": MODELO_GROQ, "language": "es", "response_format": "text", "temperature": "0"},
                     timeout=TIMEOUT_GROQ_S,
                 )
         except (requests.Timeout, requests.ConnectionError) as e:
             raise ErrorReintentable(f"sin respuesta ({type(e).__name__})") from e
-        revisar_respuesta_groq(r, f"Groq ({contexto})")
+        try:
+            revisar_respuesta_groq(r, f"Groq ({contexto})")
+        except SinCuotaGroq:
+            clave.estado["sin_cuota_groq"] = True
+            raise
         texto = r.text.strip()
         if len(texto) < MIN_CARACTERES:
             raise ErrorReintentable(f"devolvió {len(texto)} caracteres")
@@ -611,28 +740,31 @@ def transcribir_con_gemini(api_key, ruta, contexto):
         borrar_de_gemini(api_key, archivo_gemini["name"])
 
 
-def transcribir_tramo(claves, ruta, contexto, solo_groq=False):
-    """Transcribe un tramo con Groq y, si falla, con Gemini. Devuelve (texto, motor)."""
-    groq_key = claves.get("groq")
-    if groq_key and not ESTADO["sin_cuota_groq"]:
+def transcribir_tramo(claves, ruta, contexto, solo_groq=False, materia=None):
+    """Transcribe un tramo con Groq (key de la materia) y, si falla, con Gemini.
+
+    Devuelve (texto, motor, etiqueta de la key de Groq usada o None).
+    """
+    clave = GROQ.para(materia)
+    if clave and not clave.estado["sin_cuota_groq"]:
         try:
-            return transcribir_con_groq(groq_key, ruta, contexto), "groq"
+            texto, usada = con_clave_groq(materia, lambda c: transcribir_con_groq(c, ruta, contexto))
+            return texto, "groq", usada.etiqueta
         except SinCuotaGroq as e:
-            ESTADO["sin_cuota_groq"] = True
             if solo_groq:
                 raise
-            log(f"{e} Sigo con Gemini en esta corrida.")
+            log(f"{e} Sigo con Gemini en esta corrida (key {clave.etiqueta}).")
         except Exception as e:  # noqa: BLE001
             if solo_groq:
                 raise
             log(f"Groq falló ({contexto}): {e}. Pruebo con Gemini.")
     elif solo_groq:
-        raise RuntimeError("Modo de prueba: falta GROQ_API_KEY o Groq no tiene cuota.")
+        raise RuntimeError("Modo de prueba: falta la key de Groq de esta materia o no tiene cuota.")
 
     if ESTADO["sin_cuota_gemini"]:
         raise CuotaDiariaAgotada(f"{contexto}: Groq no disponible y cuota diaria de Gemini agotada.")
     try:
-        return transcribir_con_gemini(claves["gemini"], ruta, contexto), "gemini"
+        return transcribir_con_gemini(claves["gemini"], ruta, contexto), "gemini", None
     except CuotaDiariaAgotada:
         ESTADO["sin_cuota_gemini"] = True
         raise
@@ -741,18 +873,18 @@ def tema_de_clase(glosario, base):
     return None
 
 
-def palabras_por_bloque(glosario):
+def palabras_por_bloque(glosario, limite_minuto=LIMITE_TOKENS_MINUTO_CORRECCION):
     """Achica los bloques si el glosario es largo, para entrar holgado en el límite por minuto."""
     # prompt + glosario (~3,5 caracteres por token) + razonamiento del modelo
     tokens_fijos = (len(PROMPT_CORRECCION) + len(glosario or "")) / 3.5 + 1000
-    disponible = LIMITE_TOKENS_MINUTO_CORRECCION * 0.85 - tokens_fijos
+    disponible = limite_minuto * 0.85 - tokens_fijos
     # Entrada + salida (texto corregido + lista de correcciones) ≈ 2,1 veces el bloque.
     return max(200, min(PALABRAS_POR_BLOQUE, int(disponible / (TOKENS_POR_PALABRA * 2.1))))
 
 
-def esperar_limite_minuto(tokens_estimados):
-    """Si el último pedido dejó pocos tokens por minuto, espera a que se renueven."""
-    restantes, renueva_en = ESTADO.get("correccion_restantes"), ESTADO.get("correccion_renueva")
+def esperar_limite_minuto(clave, tokens_estimados):
+    """Si el último pedido de ESTA key dejó pocos tokens por minuto, espera a que se renueven."""
+    restantes, renueva_en = clave.estado["restantes"], clave.estado["renueva"]
     if restantes is None or renueva_en is None or restantes >= tokens_estimados:
         return
     espera = renueva_en - time.time()
@@ -761,14 +893,22 @@ def esperar_limite_minuto(tokens_estimados):
         time.sleep(espera + 1)
 
 
-def anotar_limites(r):
+def anotar_limites(clave, r):
+    """Guarda en el estado de la key el presupuesto por minuto que informa Groq."""
+    estado = clave.estado
     restantes = r.headers.get("x-ratelimit-remaining-tokens")
     renueva = segundos_de_duracion(r.headers.get("x-ratelimit-reset-tokens"))
     try:
-        ESTADO["correccion_restantes"] = int(float(restantes)) if restantes is not None else None
+        estado["restantes"] = int(float(restantes)) if restantes is not None else None
     except ValueError:
-        ESTADO["correccion_restantes"] = None
-    ESTADO["correccion_renueva"] = time.time() + renueva if renueva is not None else None
+        estado["restantes"] = None
+    estado["renueva"] = time.time() + renueva if renueva is not None else None
+    try:
+        limite = int(float(r.headers.get("x-ratelimit-limit-tokens")))
+        if limite > 0:
+            estado["limite_minuto"] = limite
+    except (TypeError, ValueError):
+        pass
 
 
 def normalizar_correcciones(lista):
@@ -790,7 +930,7 @@ def normalizar_correcciones(lista):
     return list(dict.fromkeys(pares))
 
 
-def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
+def corregir_bloque(clave, bloque, glosario, tema, contexto):
     """Pide la corrección de un bloque. Devuelve (texto, [(original, corregido)])."""
     usuario = (
         f"GLOSARIO DE LA MATERIA:\n{glosario or '(no hay glosario para esta materia)'}\n\n"
@@ -799,13 +939,13 @@ def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
     )
     tokens_bloque = len(bloque.split()) * TOKENS_POR_PALABRA
     max_salida = int(tokens_bloque * 1.3) + 1500
-    esperar_limite_minuto(int((len(PROMPT_CORRECCION) + len(usuario)) / 3.5) + max_salida)
+    esperar_limite_minuto(clave, int((len(PROMPT_CORRECCION) + len(usuario)) / 3.5) + max_salida)
 
     def _llamar():
         try:
             r = requests.post(
                 GROQ_CHAT_URL,
-                headers={"Authorization": f"Bearer {groq_key}"},
+                headers={"Authorization": f"Bearer {clave.valor}"},
                 json={
                     "model": MODELO_CORRECCION,
                     "temperature": 0,
@@ -821,7 +961,7 @@ def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
             )
         except (requests.Timeout, requests.ConnectionError) as e:
             raise ErrorReintentable(f"sin respuesta ({type(e).__name__})") from e
-        anotar_limites(r)
+        anotar_limites(clave, r)
         if r.status_code == 200:
             return r.json()
         try:
@@ -832,12 +972,16 @@ def corregir_bloque(groq_key, bloque, glosario, tema, contexto):
         if r.status_code == 429:
             espera = segundos_de_duracion(r.headers.get("retry-after")) or segundos_espera_groq(r)
             if re.search(r"per day|\((TPD|RPD)\)", mensaje, re.I):
-                raise SinCuotaCorreccion("cuota diaria del corrector agotada.")
+                clave.estado["sin_cuota_correccion"] = True
+                raise SinCuotaCorreccion(f"cuota diaria del corrector agotada (key {clave.etiqueta}).")
             if espera is not None and espera > MAX_ESPERA_GROQ_S:
-                raise SinCuotaCorreccion(f"el corrector pide esperar {espera / 60:.0f} min.")
+                clave.estado["sin_cuota_correccion"] = True
+                raise SinCuotaCorreccion(f"el corrector pide esperar {espera / 60:.0f} min (key {clave.etiqueta}).")
             raise ErrorReintentable("respondió 429 (límite por minuto)", espera=espera)
         if r.status_code >= 500:
             raise ErrorReintentable(f"respondió {r.status_code}")
+        if r.status_code in (401, 403):
+            raise ClaveRechazada(f"respondió {r.status_code}: {mensaje}", r.status_code)
         if r.status_code == 400 and error.get("code") == "json_validate_failed":
             raise BloqueDescartado("el modelo no devolvió JSON válido")
         raise RuntimeError(f"respondió {r.status_code}: {mensaje}")
@@ -1062,29 +1206,33 @@ def aplicar_correcciones(bloque, pares, ajustables=()):
     return patron.sub(reemplazar, bloque)
 
 
-def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
+def corregir_transcripcion(materia, texto, glosario, clase, etiqueta):
     """Corrige la transcripción por bloques. Nunca falla: ante problemas usa el original.
 
+    Usa la key de Groq de la materia (con fallback a la propia si la de la amiga
+    es rechazada) y frena solo si ESA key agotó su cuota diaria.
     Devuelve (texto final, correcciones sin repetir, resumen dict).
     """
     resumen = {"bloques": 0, "corregidos": 0, "descartados": 0, "sin_corregir": 0, "auditoria": []}
-    if not groq_key or ESTADO["sin_cuota_correccion"]:
-        motivo = "sin GROQ_API_KEY" if not groq_key else "cuota del corrector agotada en esta corrida"
+    clave = GROQ.para(materia)
+    if clave is None or clave.estado["sin_cuota_correccion"]:
+        motivo = "sin GROQ_API_KEY" if clave is None else "cuota del corrector agotada en esta corrida"
         log(f"{etiqueta}: se guarda sin corregir ({motivo}).")
         return texto, [], dict(resumen, sin_corregir=1, motivo=motivo)
 
     tema = tema_de_clase(glosario, clase)
     info = preparar_glosario(glosario)
-    palabras = palabras_por_bloque(glosario)
+    palabras = palabras_por_bloque(glosario, clave.estado["limite_minuto"])
     bloques = dividir_en_bloques(texto, palabras)
     resumen["bloques"] = len(bloques)
     log(f"{etiqueta}: corrigiendo {len(bloques)} bloque(s) de ~{palabras} palabras con {MODELO_CORRECCION} "
-        f"({'con' if glosario else 'sin'} glosario; tema: {tema or 'no figura'}).")
+        f"(key {clave.etiqueta}; {'con' if glosario else 'sin'} glosario; tema: {tema or 'no figura'}).")
 
     salida, correcciones, fallas_seguidas, cortar = [], [], 0, None
     for n, (bloque, sep) in enumerate(bloques, 1):
-        if cortar is None and ESTADO["sin_cuota_correccion"]:
-            cortar = "cuota del corrector agotada"
+        clave = GROQ.para(materia)   # puede cambiar a mitad de clase si rechazan la key de la amiga
+        if cortar is None and (clave is None or clave.estado["sin_cuota_correccion"]):
+            cortar = "cuota del corrector agotada" if clave else "no hay key de Groq"
         if cortar is None and tiempo_agotado():
             cortar = "se acabó el tiempo de la corrida"
         if cortar:
@@ -1092,8 +1240,9 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
             resumen["sin_corregir"] += 1
             continue
         try:
-            _, propuestas = corregir_bloque(groq_key, bloque, glosario, tema,
-                                            {"clase": clase, "n": n, "total": len(bloques)})
+            (_, propuestas), _ = con_clave_groq(
+                materia, lambda c: corregir_bloque(c, bloque, glosario, tema,
+                                                   {"clase": clase, "n": n, "total": len(bloques)}))
             aceptadas, ajustables = [], set()
             for original, corregido in propuestas:
                 corregido = normalizar_guiones(corregido)
@@ -1122,8 +1271,7 @@ def corregir_transcripcion(groq_key, texto, glosario, clase, etiqueta):
                 resumen["auditoria"].append({"bloque": n, "original": original, "correccion": corregido,
                                              "estado": "descartada", "regla": f"bloque descartado: {e}"})
             log(f"{etiqueta}: bloque {n}/{len(bloques)} DESCARTADO ({e}); queda el original.")
-        except SinCuotaCorreccion as e:
-            ESTADO["sin_cuota_correccion"] = True
+        except SinCuotaCorreccion as e:   # la bandera ya quedó en el estado de esa key
             salida.append(bloque + sep)
             resumen["sin_corregir"] += 1
             log(f"{etiqueta}: {e} El resto queda sin corregir.")
@@ -1246,11 +1394,13 @@ def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_part
 
             tramo = Path(tmp) / f"tramo_{i + 1}.mp3"
             extraer_tramo(ruta, i * (largo - 1), largo, tramo)
-            texto, motor = transcribir_tramo(claves, tramo, f"{salida}, tramo {i + 1}/{total}", solo_groq)
+            texto, motor, clave_usada = transcribir_tramo(
+                claves, tramo, f"{salida}, tramo {i + 1}/{total}", solo_groq, materia=materia)
 
             guardar_texto(drive, carpeta_partes, nombre_parte, texto)
             partes_existentes[nombre_parte] = True
-            log(f"{etiqueta}: tramo {i + 1}/{total} OK con {motor} ({len(texto)} caracteres).")
+            motor_log = f"{motor} (key {clave_usada})" if clave_usada else motor
+            log(f"{etiqueta}: tramo {i + 1}/{total} OK con {motor_log} ({len(texto)} caracteres).")
             if motor == "gemini" and i + 1 < total:
                 # Cada tramo son ~77.000 tokens: pausa para no pasar el límite por minuto de Gemini.
                 time.sleep(PAUSA_ENTRE_TRAMOS_S)
@@ -1263,7 +1413,7 @@ def transcribir_audio(drive, claves, materia, audio, carpeta_trans, carpeta_part
         if salida + SUFIJO_SIN_CORREGIR not in partes:
             guardar_texto(drive, carpeta_partes, salida + SUFIJO_SIN_CORREGIR, texto)
         glosario = glosario_de(drive, carpeta_materia, materia)
-        corregido, correcciones, resumen = corregir_transcripcion(claves.get("groq"), texto, glosario, base, etiqueta)
+        corregido, correcciones, resumen = corregir_transcripcion(materia, texto, glosario, base, etiqueta)
         for linea in resumen_auditoria(resumen["auditoria"]) if resumen["auditoria"] else []:
             log(f"{etiqueta}: {linea}")
         texto = corregido + seccion_correcciones(correcciones, resumen)
@@ -1324,50 +1474,81 @@ def resumir_pendientes(drive, api_key, m):
                 log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
 
 
-def sin_transcriptor():
-    """True si ni Groq ni Gemini pueden transcribir más en esta corrida."""
-    return ESTADO["sin_cuota_gemini"] and ESTADO["sin_cuota_groq"]
+def sin_transcriptor(clave):
+    """True si ni Groq (con esa key) ni Gemini pueden transcribir más en esta corrida."""
+    return ESTADO["sin_cuota_gemini"] and (clave is None or clave.estado["sin_cuota_groq"])
 
 
-def transcribir_pendientes(drive, claves, m):
+def intercalar(propia, amiga):
+    """Alterna un elemento de cada lista; si solo hay de una, la devuelve tal cual.
+
+    Con las dos, empieza una al azar (así ninguna lleva siempre el primer lugar
+    de la corrida) y, cuando una se queda sin elementos, sigue con lo que resta.
+    """
+    if not propia or not amiga:
+        return list(propia or amiga)
+    primera, segunda = (propia, amiga) if random.random() < 0.5 else (amiga, propia)
+    cola = []
+    for a, b in zip(primera, segunda):
+        cola += [a, b]
+    n = min(len(primera), len(segunda))
+    return cola + list(primera[n:]) + list(segunda[n:])
+
+
+def transcribir_pendientes(drive, claves, preparadas):
     """Fase 2: transcribir audios sin transcripción (y resumirlos si hay tiempo).
 
-    Los pendientes se procesan en orden aleatorio para que un audio
-    problemático no se lleve siempre el primer intento (y la cuota) de
-    cada corrida.
+    Dentro de cada materia los pendientes van en orden aleatorio, para que un
+    audio problemático no se lleve siempre el primer intento (y la cuota) de
+    cada corrida. Cuando hay pendientes de las dos personas (materias propias y
+    de MATERIAS_AMIGA) se alternan, para que una no acapare los 45 minutos.
     """
-    existentes = archivos_por_nombre(drive, m["trans"])
-    pendientes = [a for a in m["audios"] if nombre_base(a["name"]) not in existentes]
-    random.shuffle(pendientes)
-    if pendientes:
-        log(f"[{m['materia']}] {len(pendientes)} audio(s) sin transcribir: {', '.join(nombre_base(a['name']) for a in pendientes)}")
+    colas = {"propia": [], "amiga": []}
+    for m in preparadas:
+        existentes = archivos_por_nombre(drive, m["trans"])
+        pendientes = [a for a in m["audios"] if nombre_base(a["name"]) not in existentes]
+        random.shuffle(pendientes)
+        if pendientes:
+            log(f"[{m['materia']}] {len(pendientes)} audio(s) sin transcribir: {', '.join(nombre_base(a['name']) for a in pendientes)}")
+        colas[GROQ.persona(m["materia"])] += [(m, a) for a in pendientes]
+    if colas["propia"] and colas["amiga"]:
+        log(f"Hay audios pendientes de las dos personas ({len(colas['propia'])} y {len(colas['amiga'])}): los alterno.")
+    sin_avisar = set()
 
-    for audio in pendientes:
-        if tiempo_agotado() or sin_transcriptor():
+    for m, audio in intercalar(colas["propia"], colas["amiga"]):
+        if tiempo_agotado():
             return
-        base = nombre_base(audio["name"])
+        materia, base = m["materia"], nombre_base(audio["name"])
+        clave = GROQ.para(materia)
+        if sin_transcriptor(clave):
+            identidad = clave.identidad if clave else None
+            if identidad not in sin_avisar:
+                sin_avisar.add(identidad)
+                log(f"[{materia}] sin Groq (key {clave.etiqueta if clave else 'ninguna'}) ni Gemini: "
+                    f"salteo sus audios hasta que se renueve la cuota.")
+            continue
         try:
-            if not transcribir_audio(drive, claves, m["materia"], audio, m["trans"], m["partes"],
+            if not transcribir_audio(drive, claves, materia, audio, m["trans"], m["partes"],
                                      carpeta_materia=m["carpeta"]):
                 return
         except CuotaDiariaAgotada as e:
             ESTADO["sin_cuota_gemini"] = True
-            if sin_transcriptor():
-                log(f"{e} Sin Groq ni Gemini: no se transcribe más hasta que se renueve la cuota.")
-                return
-            log(f"[{m['materia']}] {base}: {e} Sigo con el próximo audio.")
+            if sin_transcriptor(GROQ.para(materia)):
+                log(f"{e} Sin Groq ni Gemini para esta materia: no se transcribe más hasta que se renueve la cuota.")
+                continue
+            log(f"[{materia}] {base}: {e} Sigo con el próximo audio.")
             continue
         except Exception as e:  # noqa: BLE001 - seguir con el resto aunque uno falle
-            log(f"[{m['materia']}] {base}: ERROR al transcribir: {e}")
+            log(f"[{materia}] {base}: ERROR al transcribir: {e}")
             continue
 
         # Recién transcripta: resumirla ya, si queda tiempo
         nuevos = archivos_por_nombre(drive, m["trans"])
         if HACER_RESUMENES and base in nuevos and not tiempo_agotado():
             try:
-                resumir(drive, claves["gemini"], m["materia"], base, nuevos[base], m["trans"])
+                resumir(drive, claves["gemini"], materia, base, nuevos[base], m["trans"])
             except Exception as e:  # noqa: BLE001
-                log(f"[{m['materia']}] {base}: ERROR al resumir: {e}")
+                log(f"[{materia}] {base}: ERROR al resumir: {e}")
 
 
 def copiar_resumenes_spark(drive, materias):
@@ -1377,8 +1558,10 @@ def copiar_resumenes_spark(drive, materias):
       CLASES GRABDAS/<materia>/"dd-mm - Resumen de clase"
     Este paso los copia a CLASES/<materia>/Resúmenes de clase, que sí ve Claude.
     Se activa definiendo CARPETA_RESUMENES_SPARK_ID (ID de "CLASES GRABDAS").
-    Las subcarpetas se emparejan con las materias ignorando tildes y
-    mayúsculas ("ECONOMETRIA II" = "Econometría II").
+    Las subcarpetas se emparejan con las materias ignorando tildes, mayúsculas
+    y espacios de más ("ECONOMETRIA II" = "Econometría II"). Si dos carpetas
+    DISTINTAS normalizan al mismo nombre (en CLASES o del lado de Spark), no se
+    copia nada para esa materia y se avisa en el log.
     """
     origen_raiz = os.environ.get("CARPETA_RESUMENES_SPARK_ID")
     if not origen_raiz:
@@ -1386,9 +1569,27 @@ def copiar_resumenes_spark(drive, materias):
     subcarpetas_spark = {}
     for i in listar(drive, origen_raiz):
         if i["mimeType"] == "application/vnd.google-apps.folder":
-            subcarpetas_spark.setdefault(normalizar(i["name"]), []).append(i["id"])
+            subcarpetas_spark.setdefault(normalizar(i["name"]), []).append(i)
+    materias_por_nombre = {}
     for materia, carpeta_id in materias:
-        for origen in subcarpetas_spark.get(normalizar(materia), []):
+        materias_por_nombre.setdefault(normalizar(materia), {})[carpeta_id] = materia
+    for materia, carpeta_id in materias:
+        clave = normalizar(materia)
+        # Dos carpetas DISTINTAS con el mismo nombre normalizado (de un lado o del
+        # otro): no se adivina, no se copia nada y se avisa.
+        homonimas = materias_por_nombre[clave]
+        if len(homonimas) > 1:
+            if carpeta_id == min(homonimas):
+                log(f"AVISO: en CLASES hay {len(homonimas)} carpetas que normalizan al mismo nombre "
+                    f"({', '.join(repr(n) for n in homonimas.values())}); no copio resúmenes de Spark para ninguna.")
+            continue
+        candidatas = subcarpetas_spark.get(clave, [])
+        if len(candidatas) > 1:
+            log(f"[{materia}] AVISO: hay {len(candidatas)} carpetas de Spark que normalizan a este nombre "
+                f"({', '.join(repr(c['name']) for c in candidatas)}); no copio nada para no adivinar.")
+            continue
+        for origen_carpeta in candidatas:
+            origen = origen_carpeta["id"]
             try:
                 resumenes = [
                     i for i in listar(drive, origen)
@@ -1427,10 +1628,12 @@ def prueba_groq(drive, claves, materias, materia_buscada, audio_buscado):
     transcripción existente ni usar Gemini. Si ya existe, no hace nada (borrar
     ese Doc para repetir la prueba).
     """
-    if not claves.get("groq"):
-        sys.exit("Modo de prueba: falta GROQ_API_KEY.")
     m = buscar_materia(drive, materias, materia_buscada)
     materia = m["materia"]
+    clave = GROQ.para(materia)
+    if clave is None:
+        sys.exit("Modo de prueba: falta la key de Groq de esta materia (GROQ_API_KEY o GROQ_API_KEY_AMIGA).")
+    log(f"[{materia}] MODO PRUEBA: key de Groq: {clave.etiqueta}.")
     buscado = normalizar(nombre_base(audio_buscado))
     audio = next((a for a in m["audios"] if normalizar(nombre_base(a["name"])) == buscado), None)
     if not audio:
@@ -1459,10 +1662,12 @@ def prueba_correccion(drive, claves, materias, materia_buscada, clase_buscada):
     Guarda "<clase> (corregida)" en Transcripciones sin tocar el original, y
     lista en el log todas las correcciones. Si ya existe, no hace nada.
     """
-    if not claves.get("groq"):
-        sys.exit("Modo de prueba: falta GROQ_API_KEY.")
     m = buscar_materia(drive, materias, materia_buscada)
     materia = m["materia"]
+    clave = GROQ.para(materia)
+    if clave is None:
+        sys.exit("Modo de prueba: falta la key de Groq de esta materia (GROQ_API_KEY o GROQ_API_KEY_AMIGA).")
+    log(f"[{materia}] MODO PRUEBA: key de Groq: {clave.etiqueta}.")
     existentes = archivos_por_nombre(drive, m["trans"])
     buscado = normalizar(nombre_base(clase_buscada))
     base = next((n for n in existentes if normalizar(n) == buscado), None)
@@ -1478,7 +1683,7 @@ def prueba_correccion(drive, claves, materias, materia_buscada, clase_buscada):
     texto = quitar_seccion_correcciones(leer_texto(drive, existentes[base]).strip())
     glosario = glosario_de(drive, m["carpeta"], materia)
     inicio = time.time()
-    corregido, correcciones, resumen = corregir_transcripcion(claves["groq"], texto, glosario, base, etiqueta)
+    corregido, correcciones, resumen = corregir_transcripcion(materia, texto, glosario, base, etiqueta)
     guardar_texto(drive, m["trans"], salida, corregido + seccion_correcciones(correcciones, resumen), como_doc=True)
     log(f"{etiqueta}: MODO PRUEBA: guardado en {(time.time() - inicio) / 60:.1f} min. "
         f"Largo: {len(texto)} -> {len(corregido)} caracteres.")
@@ -1504,10 +1709,29 @@ def prueba_correccion(drive, claves, materias, materia_buscada, clase_buscada):
         log(f"{etiqueta}: {linea}")
 
 
+def avisar_materias_amiga(materias):
+    """Log de qué materias usan la key de la amiga y chequeo de MATERIAS_AMIGA."""
+    if not GROQ.materias_amiga:
+        return
+    por_nombre = {}
+    for nombre, carpeta_id in materias:
+        por_nombre.setdefault(normalizar(nombre), set()).add(carpeta_id)
+    for n in sorted(GROQ.materias_amiga):
+        if n not in por_nombre:
+            log(f"AVISO: MATERIAS_AMIGA menciona '{n}' pero no hay una carpeta de materia con ese nombre.")
+        elif len(por_nombre[n]) > 1:
+            log(f"AVISO: MATERIAS_AMIGA menciona '{n}' y hay {len(por_nombre[n])} carpetas que normalizan igual.")
+    propias = [nombre for nombre, _ in materias if GROQ.es_de_amiga(nombre)]
+    log(f"Materias con key de la amiga ({'cargada' if GROQ.amiga else 'NO cargada: uso la propia'}): "
+        f"{', '.join(propias) or 'ninguna'}.")
+
+
 def main():
     drive = conectar_drive()
     materias = obtener_materias(drive, env("CARPETA_CLASES_ID"))
-    claves = {"groq": os.environ.get("GROQ_API_KEY"), "gemini": os.environ.get("GEMINI_API_KEY")}
+    global GROQ
+    GROQ = ResolutorGroq.desde_entorno()
+    claves = {"gemini": os.environ.get("GEMINI_API_KEY")}
 
     prueba_materia = os.environ.get("PRUEBA_MATERIA", "").strip()
     prueba_audio = os.environ.get("PRUEBA_GROQ_AUDIO", "").strip()
@@ -1523,12 +1747,13 @@ def main():
         return
 
     claves["gemini"] = env("GEMINI_API_KEY")
-    if not claves["groq"]:
-        ESTADO["sin_cuota_groq"] = True
-        log("AVISO: falta GROQ_API_KEY; se transcribe solo con Gemini.")
+    if GROQ.propia is None:
+        log("AVISO: falta GROQ_API_KEY; las materias sin key de Groq se transcriben solo con Gemini.")
     log(f"Materias: {', '.join(m for m, _ in materias) or 'ninguna'}"
-        f" | transcripción: {'Groq, con Gemini de respaldo' if claves['groq'] else 'Gemini'}"
+        f" | transcripción: {'Groq, con Gemini de respaldo' if GROQ.propia else 'Gemini'}"
         f" | resúmenes en este script: {'sí' if HACER_RESUMENES else 'no (los hace Gemini Spark)'}")
+
+    avisar_materias_amiga(materias)
 
     # Fase 0: copiar resúmenes de Spark (rápido, no usa IA)
     copiar_resumenes_spark(drive, materias)
@@ -1547,15 +1772,13 @@ def main():
         except Exception as e:  # noqa: BLE001
             log(f"[{m['materia']}] ERROR inesperado en resúmenes: {e}")
 
-    # Fase 2: transcripciones pendientes
-    for m in preparadas:
-        if tiempo_agotado():
-            log("Tiempo de la corrida agotado; lo pendiente sigue en la próxima.")
-            break
-        try:
-            transcribir_pendientes(drive, claves, m)
-        except Exception as e:  # noqa: BLE001
-            log(f"[{m['materia']}] ERROR inesperado en transcripciones: {e}")
+    # Fase 2: transcripciones pendientes (las dos personas se alternan)
+    try:
+        transcribir_pendientes(drive, claves, preparadas)
+    except Exception as e:  # noqa: BLE001
+        log(f"ERROR inesperado en transcripciones: {e}")
+    if tiempo_agotado():
+        log("Tiempo de la corrida agotado; lo pendiente sigue en la próxima.")
 
     log("Fin de la corrida.")
 
